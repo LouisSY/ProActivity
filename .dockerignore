@@ -2,7 +2,7 @@ xlstm-main/
 reports/
 images/
 Dockerfile
-README.md
+README_original.md
 .venv/
 CARLA_*/
 CARLA_0.9.16/
