@@ -37,6 +37,7 @@ services:
 #      - src/ProVoice/drive.py # You need to set Carla.Client() to `host.docker.internal`
   provoice:
     container_name: provoice
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile

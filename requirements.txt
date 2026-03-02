@@ -1,0 +1,5 @@
+carla==0.9.16
+numpy==1.26.4
+packaging==26.0
+pygame==2.6.1
+uv==0.10.7
