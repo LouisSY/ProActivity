@@ -5,12 +5,14 @@ import sys
 import time
 import os
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import uvicorn
 
 try:
     import carla
     HAS_CARLA = True
-except NotImplementedError:
+except Exception:
     carla = None  # type: ignore
     HAS_CARLA = False
 
