@@ -82,6 +82,10 @@ Carla does not yet have native support for Mac (Apple Silicon), and Docker-based
     
     ![Carla App](READMEImages/Carla_app.png)
 
+19. You can now use the Carla simulator as normal. 
+
+    ![Carla Simulator](READMEImages/carla_simulator.png)
+
 
 ### Acknowledgements
 
