@@ -12,3 +12,7 @@
    - `data/decisions.csv`
    - `data/raw_data.jsonl`
 
+
+## Documentation
+- Mac setup guide (Apple Silicon): [docs/README_Setups_on_Mac.md](docs/README_Setups_on_Mac.md)
+- Original README (archived): [docs/README_original.md](docs/README_original.md)
