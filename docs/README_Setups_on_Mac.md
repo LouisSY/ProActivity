@@ -81,3 +81,11 @@ Carla does not yet have native support for Mac (Apple Silicon), and Docker-based
 18. Once **Test Run** is successful, you can launch Carla directly by clicking the **Carla.app** icon in Finder.
     
     ![Carla App](READMEImages/Carla_app.png)
+
+
+### Acknowledgements
+
+The method for running Carla on Apple Silicon Macs is based on the following GitHub Discussion:
+https://github.com/carla-simulator/carla/discussions/9037
+
+Many thanks to the contributors in that thread for sharing the solution.
