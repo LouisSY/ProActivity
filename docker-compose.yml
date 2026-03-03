@@ -38,6 +38,8 @@ services:
   provoice:
     container_name: provoice
     platform: linux/amd64
+    stdin_open: true # Equivalent to -i
+    tty: true        # Equivalent to -t
     build:
       context: .
       dockerfile: Dockerfile
@@ -53,3 +55,9 @@ services:
 #      NVIDIA_DRIVER_CAPABILITIES: "all"
     ports:
       - "8050:8050"
+      - "2000:2000"
+      - "2001:2001"
+      - "2002:2002"
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"

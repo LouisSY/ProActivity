@@ -45,6 +45,7 @@ def _load_emotion_model(path: str) -> None:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     _emotion_model = load_model(path, compile=False)  # type: ignore
+    print(f"[_load_emotion_model] Emotion model loaded successfully from {path}")
     _face_detector = cv2.CascadeClassifier(  # type: ignore
         os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
     )
@@ -104,18 +105,23 @@ class DataCollector:
                 self.visual_enabled = False
             if HAS_MP:
                 try:
+                    print("[DataCollector] Initializing MediaPipe Face Mesh...")
                     self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)  # type: ignore
+                    print("[DataCollector] MediaPipe Face Mesh loaded successfully.")
                 except NotImplementedError as e:
                     print(e, "Error initializing face mesh")
                     self.face_mesh = None
 
-        if HAS_RPPG and OnlineRPPG is not None:
-            try:
-                self.rppg_estimator = OnlineRPPG(frame_rate=10, crop_size=72)  # type: ignore
-            except NotImplementedError as e:
-                print(e, "Error initializing rPPG estimator")
-                self.rppg_estimator = None
-                raise e
+            if HAS_MYFRAME and myframe is not None:
+                print("[DataCollector] YOLOv5 behavior detection module detected.")
+
+            if HAS_RPPG and OnlineRPPG is not None:
+                try:
+                    self.rppg_estimator = OnlineRPPG(frame_rate=10, crop_size=72)  # type: ignore
+                except NotImplementedError as e:
+                    print(e, "Error initializing rPPG estimator")
+                    self.rppg_estimator = None
+                    raise e
         else:
             self.rppg_estimator = None
 

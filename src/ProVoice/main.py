@@ -157,7 +157,7 @@ def main():
                 conservative=True,
             )
             strategy = fcd_engine
-            print("[main] FCD model loaded")
+            print("[main] FCD model loaded successfully from trained_models/fcd_levels.pkl")
         except NotImplementedError as e:
             print("[main] FCD load error:", e)
             strategy = LoAZeroFallback("FCD model load error → LoA0")
@@ -170,7 +170,7 @@ def main():
                 conservative=True,
             )
             strategy = fcd_engine
-            print("[main] FCD model loaded")
+            print("[main] FCD model loaded successfully for collection")
         except NotImplementedError as e:
             print("[main] FCD load error:", e)
             strategy = LoAZeroFallback("FCD model load error → LoA0")
@@ -184,7 +184,7 @@ def main():
                     window=window_sz,
                     fcd_fallback=None,
                 )
-                print("[main] xlstm model loaded")
+                print("[main] xLSTM model loaded successfully from trained_models/state_xlstm.pt")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
@@ -193,7 +193,7 @@ def main():
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
-                print("[main] STATE model loaded")
+                print("[main] STATE (classic) model loaded successfully from trained_models/state_levels.pkl")
             strategy = state_engine
         except NotImplementedError as e:
             print("[main] STATE load error:", e)
@@ -208,6 +208,7 @@ def main():
                 default_function=functionname,
                 conservative=True,
             )
+            print("[main] Combined-FCD part loaded successfully.")
         except NotImplementedError as e:
             print("[main] FCD load error:", e)
             fcd_engine = LoAZeroFallback("FCD model load error → LoA0")
@@ -221,6 +222,7 @@ def main():
                     window=window_sz,
                     fcd_fallback=None,
                 )
+                print("[main] Combined-STATE (xLSTM) part loaded successfully.")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
@@ -229,6 +231,7 @@ def main():
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
+                print("[main] Combined-STATE (classic) part loaded successfully.")
         except NotImplementedError as e:
             print("[main] STATE load error:", e)
             state_engine = LoAZeroFallback("STATE model load error → LoA0")
@@ -240,6 +243,7 @@ def main():
                 w_fcd=w_fcd,
                 conservative=True,
             )
+            print("[main] CombinedFusionStrategy initialized successfully.")
         except NotImplementedError as e:
             print("[main] Combined init error:", e)
             strategy = fcd_engine if fcd_engine is not None else LoAZeroFallback("Combined init error → LoA0")

@@ -8,7 +8,6 @@ CARLA_*/
 CARLA_0.9.16/
 data/
 src/driverDistractedDetection/
-src/rPPG/
 ProVoice/trained_models/**
 !ProVoice/trained_models/fer2013_mini_XCEPTION.102-0.66.hdf5
 !ProVoice/trained_models/fcd_levels.pkl
