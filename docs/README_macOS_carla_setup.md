@@ -93,3 +93,5 @@ The method for running Carla on Apple Silicon Macs is based on the following Git
 https://github.com/carla-simulator/carla/discussions/9037
 
 Many thanks to the contributors in that thread for sharing the solution.
+
+ffmpeg -f avfoundation -framerate 30 -i "0" -vcodec mpeg4 -f mpegts udp://127.0.0.1:8554

@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import mediapipe as mp
+import argparse
 
 mp_face_mesh = mp.solutions.face_mesh
 
@@ -44,7 +45,31 @@ def gaze_score_on_frame(frame, face_mesh) -> float:
     return compute_gaze_score(lm, w, h)
 
 def main():
-    cap = cv2.VideoCapture(0)
+    parser = argparse.ArgumentParser(description="Gaze Score Test")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="udp",
+        choices=["local", "udp"],
+        help="Select video source: 'local' (camera) or 'udp' (default)"
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default="udp://127.0.0.1:8554",
+        help="Specify the stream address when using UDP"
+    )
+    args = parser.parse_args()
+
+    if args.source == "local":
+        video_source = 0  # local camera ID
+        print("Starting: local camera...")
+    else:
+        video_source = args.url
+        print(f"Connecting: UDP stream {video_source} ...")
+
+    cap = cv2.VideoCapture(video_source)
+
     with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True) as fm:
         while True:
             ret, frame = cap.read()

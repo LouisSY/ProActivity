@@ -63,7 +63,7 @@ class DataCollector:
         actuator: Optional[Any] = None,
         function_name: str = "fatigue_alert",
         fer_model_path: str = './src/ProVoice/trained_models/fer2013_mini_XCEPTION.102-0.66.hdf5',
-        cam_index: int = 0,
+        cam_index: int | str = 0,
         static_context: Optional[Dict[str, Any]] = None,  
         carla_vehicle: Optional[Any] = None,
     ) -> None:
@@ -95,6 +95,9 @@ class DataCollector:
         if self.visual_enabled:
             try:
                 self.cap = cv2.VideoCapture(self.cam_index)  # type: ignore
+                print(f"Connecting: {self.cam_index} ...")
+                print(f"Camera opened: {self.cap.isOpened()}")
+
             except NotImplementedError as e:
                 print(e, "Error opening camera")
                 self.cap = None

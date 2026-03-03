@@ -140,6 +140,8 @@ def main():
     state_model = args.get("state_model", args.get("statemodel", "classic")).lower()
     w_fcd = float(args.get("w_fcd", "0.5"))
     window_sz = int(args.get("window", "256"))
+    camera_source = args.get("camera_source", "front")
+    camera_url = args.get("camera_url", "udp://127.0.0.1:8554")
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
     strategy = None
@@ -155,6 +157,7 @@ def main():
                 conservative=True,
             )
             strategy = fcd_engine
+            print("[main] FCD model loaded")
         except NotImplementedError as e:
             print("[main] FCD load error:", e)
             strategy = LoAZeroFallback("FCD model load error → LoA0")
@@ -167,6 +170,7 @@ def main():
                 conservative=True,
             )
             strategy = fcd_engine
+            print("[main] FCD model loaded")
         except NotImplementedError as e:
             print("[main] FCD load error:", e)
             strategy = LoAZeroFallback("FCD model load error → LoA0")
@@ -180,6 +184,7 @@ def main():
                     window=window_sz,
                     fcd_fallback=None,
                 )
+                print("[main] xlstm model loaded")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
@@ -188,6 +193,7 @@ def main():
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
+                print("[main] STATE model loaded")
             strategy = state_engine
         except NotImplementedError as e:
             print("[main] STATE load error:", e)
@@ -247,6 +253,8 @@ def main():
         "emotion": emotion,
     }
 
+    print(f"[main] Static context: {static_context}")
+
     # ---------------------------------------------------------------------
     # Add: Read vehicle_id and attempt to connect to CARLA to get the vehicle actor (optional)
     # ---------------------------------------------------------------------
@@ -258,11 +266,24 @@ def main():
         vehicle_actor = get_carla_vehicle_by_id(vehicle_id)
         if vehicle_actor is None:
             print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
+        else:
+            print(f"[INFO] Connected to CARLA vehicle actor id={vehicle_id} type={vehicle_actor.type_id}")
     else:
         if vehicle_id is None:
             print("[WARN] No vehicle_id available; DataCollector will run without carla_vehicle.")
         elif not HAS_CARLA:
             print("[WARN] CARLA API not available in this process; DataCollector will run without carla_vehicle.")
+
+    # Determine cam_index for DataCollector
+    if camera_source == "udp":
+        cam_index = camera_url
+    elif camera_source.isdigit():
+        cam_index = int(camera_source)
+    elif camera_source == "local":
+        cam_index = 0
+    else:
+        # Default case, e.g. "front"
+        cam_index = 0
 
     # Create the data collector, passing in carla_vehicle (if available)
     data_collector = DataCollector(
@@ -274,6 +295,7 @@ def main():
         decision_engine=strategy,
         actuator=actuator,
         function_name=functionname,
+        cam_index=cam_index,
         static_context=static_context,
         carla_vehicle=vehicle_actor,  # might be None
     )
