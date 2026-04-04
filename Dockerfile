@@ -20,7 +20,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY . .
 
-EXPOSE 8050 2000 2001 2002 8000 8001 8002
+# Replace local loopback URLs in Python files inside container source
+RUN find /app/src -type f -name "*.py" -print0 | \
+    xargs -0 sed -E -i \
+    -e 's#http://127\.0\.0\.1:([0-9]+)#http://host.docker.internal:\1#g' \
+    -e 's#http://localhost:([0-9]+)#http://host.docker.internal:\1#g'
+
+
+EXPOSE 8050 2002 8000 8001 8002
 
 # Default to bash for debugging
 CMD ["/bin/bash"]
