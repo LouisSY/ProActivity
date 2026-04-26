@@ -61,6 +61,7 @@ from carla import ColorConverter as cc
 
 import argparse
 import collections
+import csv
 import datetime
 import logging
 import math
@@ -121,6 +122,27 @@ except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
 
+DEFAULT_DECISION_COLUMNS = [
+    'action',
+    'level',
+    'LoA',
+    'message',
+    'fcd',
+    'probs',
+    'profile',
+    'fallback',
+    'fallback_reason',
+]
+
+USER_SELECTION_COLUMNS = [
+    'user_selected_loa',
+    'user_selection_timestamp',
+    'user_selection_frame',
+    'user_selection_sim_time',
+    'user_selection_speed_kmh',
+]
+
+
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
 # ==============================================================================
@@ -160,6 +182,115 @@ def get_actor_blueprints(world, filter, generation):
     except:
         print("   Warning! Actor Generation is not valid. No actor will be spawned.")
         return []
+
+
+def _read_csv_headers(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+    with open(path, 'r', newline='') as f:
+        reader = csv.reader(f)
+        return next(reader, [])
+
+
+def _ensure_csv_columns(path, source_headers, added_headers):
+    existing_headers = _read_csv_headers(path)
+    headers = existing_headers[:] if existing_headers else source_headers[:]
+    for col in added_headers:
+        if col not in headers:
+            headers.append(col)
+
+    if existing_headers == headers:
+        return headers
+
+    rows = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, 'r', newline='') as f:
+            rows = list(csv.DictReader(f))
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, '') for k in headers})
+    return headers
+
+
+def append_user_loa_selection(selection_row):
+    cwd = os.getcwd()
+    decision_path = os.path.join(cwd, 'data', 'decision.csv')
+    legacy_path = os.path.join(cwd, 'data', 'decisions.csv')
+    source_headers = _read_csv_headers(decision_path)
+    if not source_headers:
+        source_headers = _read_csv_headers(legacy_path)
+    if not source_headers:
+        source_headers = DEFAULT_DECISION_COLUMNS[:]
+
+    headers = _ensure_csv_columns(decision_path, source_headers, USER_SELECTION_COLUMNS)
+    row = {k: '' for k in headers}
+    row.update(selection_row)
+
+    with open(decision_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writerow(row)
+
+
+class LoASelectionPopup(object):
+    def __init__(self, width, height, interval_seconds=20):
+        self.interval_ms = int(interval_seconds * 1000)
+        self.next_prompt_ms = 0
+        self.active = False
+        self.prompt_started_ms = 0
+        self.width = width
+        self.height = height
+        self._title_font = pygame.font.Font(pygame.font.get_default_font(), 30)
+        self._text_font = pygame.font.Font(pygame.font.get_default_font(), 24)
+        self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
+
+    def start(self):
+        self.next_prompt_ms = pygame.time.get_ticks() + self.interval_ms
+
+    def should_open(self, now_ms):
+        return (not self.active) and self.next_prompt_ms and now_ms >= self.next_prompt_ms
+
+    def open(self, now_ms):
+        self.active = True
+        self.prompt_started_ms = now_ms
+
+    def close(self, now_ms):
+        self.active = False
+        self.next_prompt_ms = now_ms + self.interval_ms
+
+    def handle_event(self, event):
+        if event.type == pygame.QUIT:
+            return 'quit', None
+        if event.type != pygame.KEYDOWN:
+            return None, None
+        if event.key == K_ESCAPE:
+            return 'quit', None
+        if event.unicode in ('0', '1', '2', '3', '4'):
+            return 'select', int(event.unicode)
+        return None, None
+
+    def render(self, display):
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(200)
+        overlay.fill((0, 0, 0))
+        display.blit(overlay, (0, 0))
+
+        lines = [
+            (self._title_font, 'LoA Selection Required'),
+            (self._text_font, 'Please choose the proper LoA for the last 20 seconds.'),
+            (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
+            (self._small_font, '0=Manual  1=Assist  2=Partial  3=Conditional  4=High automation'),
+        ]
+
+        y = int(self.height * 0.35)
+        for font, text in lines:
+            surface = font.render(text, True, (255, 255, 255))
+            rect = surface.get_rect(center=(self.width // 2, y))
+            display.blit(surface, rect)
+            y += 45
 
 
 # ==============================================================================
@@ -389,10 +520,11 @@ class KeyboardControl(object):
         if (control_mode == 'full'):
             world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
-    def parse_events(self, client, world, clock, sync_mode):
+    def parse_events(self, client, world, clock, sync_mode, events=None):
         if isinstance(self._control, carla.VehicleControl):
             current_lights = self._lights
-        for event in pygame.event.get():
+        event_list = events if events is not None else pygame.event.get()
+        for event in event_list:
             if event.type == pygame.QUIT:
                 return True
             elif event.type == pygame.KEYUP:
@@ -1296,6 +1428,8 @@ def game_loop(args):
         hud = HUD(args.width, args.height)
         world = World(sim_world, hud, args)
         controller = KeyboardControl(world, args.autopilot, args.control)
+        loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
+        loa_popup.start()
 
         if args.sync:
             sim_world.tick()
@@ -1304,10 +1438,44 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         while True:
+            clock.tick_busy_loop(60)
+            now_ms = pygame.time.get_ticks()
+            events = pygame.event.get()
+
+            if loa_popup.should_open(now_ms):
+                loa_popup.open(now_ms)
+
+            if loa_popup.active:
+                if isinstance(world.player, carla.Vehicle):
+                    pause_control = carla.VehicleControl()
+                    pause_control.throttle = 0.0
+                    pause_control.brake = 1.0
+                    pause_control.hand_brake = True
+                    world.player.apply_control(pause_control)
+                for event in events:
+                    action, selected_loa = loa_popup.handle_event(event)
+                    if action == 'quit':
+                        return
+                    if action == 'select':
+                        player_velocity = world.player.get_velocity() if world and world.player else carla.Vector3D()
+                        speed_kmh = 3.6 * math.sqrt(
+                            player_velocity.x ** 2 + player_velocity.y ** 2 + player_velocity.z ** 2)
+                        append_user_loa_selection({
+                            'user_selected_loa': selected_loa,
+                            'user_selection_timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                            'user_selection_frame': world.hud.frame if world else '',
+                            'user_selection_sim_time': round(world.hud.simulation_time, 3) if world else '',
+                            'user_selection_speed_kmh': round(speed_kmh, 2),
+                        })
+                        loa_popup.close(now_ms)
+                world.render(display)
+                loa_popup.render(display)
+                pygame.display.flip()
+                continue
+
             if args.sync:
                 sim_world.tick()
-            clock.tick_busy_loop(60)
-            if controller.parse_events(client, world, clock, args.sync):
+            if controller.parse_events(client, world, clock, args.sync, events):
                 return
             world.tick(clock)
             world.render(display)
