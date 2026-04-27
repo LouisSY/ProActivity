@@ -293,6 +293,53 @@ class LoASelectionPopup(object):
             y += 45
 
 
+class StartScreenOverlay(object):
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self._title_font = pygame.font.Font(pygame.font.get_default_font(), 40)
+        self._text_font = pygame.font.Font(pygame.font.get_default_font(), 24)
+        self._button_font = pygame.font.Font(pygame.font.get_default_font(), 28)
+
+    def _button_rect(self):
+        button_w = 220
+        button_h = 70
+        x = (self.width - button_w) // 2
+        y = int(self.height * 0.58)
+        return pygame.Rect(x, y, button_w, button_h)
+
+    def handle_event(self, event):
+        if event.type == pygame.QUIT:
+            return 'quit'
+        if event.type == pygame.KEYDOWN and event.key == K_ESCAPE:
+            return 'quit'
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._button_rect().collidepoint(event.pos):
+                return 'start'
+        return None
+
+    def render(self, display):
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(170)
+        overlay.fill((0, 0, 0))
+        display.blit(overlay, (0, 0))
+
+        title = self._title_font.render('CARLA Manual Drive', True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self.width // 2, int(self.height * 0.35)))
+        display.blit(title, title_rect)
+
+        hint = self._text_font.render('Click Start to begin driving.', True, (220, 220, 220))
+        hint_rect = hint.get_rect(center=(self.width // 2, int(self.height * 0.45)))
+        display.blit(hint, hint_rect)
+
+        button_rect = self._button_rect()
+        pygame.draw.rect(display, (30, 144, 255), button_rect, border_radius=8)
+        pygame.draw.rect(display, (255, 255, 255), button_rect, width=2, border_radius=8)
+        label = self._button_font.render('START', True, (255, 255, 255))
+        label_rect = label.get_rect(center=button_rect.center)
+        display.blit(label, label_rect)
+
+
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
 # ==============================================================================
@@ -1429,7 +1476,8 @@ def game_loop(args):
         world = World(sim_world, hud, args)
         controller = KeyboardControl(world, args.autopilot, args.control)
         loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
-        loa_popup.start()
+        start_overlay = StartScreenOverlay(args.width, args.height)
+        started = False
 
         if args.sync:
             sim_world.tick()
@@ -1441,6 +1489,26 @@ def game_loop(args):
             clock.tick_busy_loop(60)
             now_ms = pygame.time.get_ticks()
             events = pygame.event.get()
+
+            if not started:
+                if isinstance(world.player, carla.Vehicle):
+                    pause_control = carla.VehicleControl()
+                    pause_control.throttle = 0.0
+                    pause_control.brake = 1.0
+                    pause_control.hand_brake = True
+                    world.player.apply_control(pause_control)
+                for event in events:
+                    action = start_overlay.handle_event(event)
+                    if action == 'quit':
+                        return
+                    if action == 'start':
+                        started = True
+                        loa_popup.start()
+                        break
+                world.render(display)
+                start_overlay.render(display)
+                pygame.display.flip()
+                continue
 
             if loa_popup.should_open(now_ms):
                 loa_popup.open(now_ms)
