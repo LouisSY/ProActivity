@@ -232,8 +232,6 @@ src/driverDistractedDetection/
 # Project specific
 _out/
 vehicle_id.txt
-*.hdf5
-*.pkl
 src/ProVoice/reports/*.png
 src/ProVoice/image/dashboard.png
 src/ProVoice.egg-info/
