@@ -92,31 +92,49 @@ python src/ProVoice/main.py \
 - `data/user_loa_labels.csv` is the **user label log** written by the driving UI every 20 seconds.
 - `data/raw_data.jsonl` stores the raw multimodal context samples.
 
-For best alignment across the two processes, use the same `session_id` in both commands. A convenient way is to export `PV_SESSION_ID` once and pass it to both programs:
+For best alignment across the two processes, use the same `session_id` in both commands.
+
+#### Quick Start (Recommended)
+
+Use `start_both.py` to automatically generate a session ID and launch both processes in separate terminal windows with shared parameters:
 
 ```bash
+python start_both.py --participantid 001 --environment city --secondary-task none \
+  --functionname "Adjust seat positioning" --modeltype combined --state-model xlstm --w-fcd 0.7
+```
+
+This script will:
+1. Generate a unique `session_id` and save it to `.session_id`
+2. Open two new terminal windows (PowerShell on Windows, Terminal/gnome-terminal on macOS/Linux)
+3. Launch `drive_improved.py` in the first window
+4. Launch `provoice` in the second window
+
+Both processes will automatically use the same session ID for data alignment.
+
+#### Manual Launch (Alternative)
+
+If you prefer to launch manually in two separate terminal windows, export the session ID first:
+
+**macOS/Linux:**
+```bash
 export PV_SESSION_ID=$(uuidgen)
+cd proactivity-main
+# In first terminal:
+python -m src.drive.drive_improved --control test --session-id "$PV_SESSION_ID" --participantid 001 --environment city --secondary-task none --functionname "Adjust seat positioning" --modeltype combined --state-model xlstm --w-fcd 0.7
 
-python -m src.drive.drive_improved \
-  --control test \
-  --session-id "$PV_SESSION_ID" \
-  --participantid 001 \
-  --environment city \
-  --secondary-task none \
-  --functionname "Adjust seat positioning" \
-  --modeltype combined \
-  --state-model xlstm \
-  --w-fcd 0.7
+# In second terminal:
+uv run provoice session_id=$PV_SESSION_ID participantid=001 environment=city secondary_task=none functionname="Adjust seat positioning" modeltype=combined state_model=xlstm w_fcd=0.7
+```
 
-uv run provoice \
-  session_id=$PV_SESSION_ID \
-  participantid=001 \
-  environment=city \
-  secondary_task=none \
-  functionname="Adjust seat positioning" \
-  modeltype=combined \
-  state_model=xlstm \
-  w_fcd=0.7
+**Windows (PowerShell):**
+```powershell
+$env:PV_SESSION_ID = [guid]::NewGuid().ToString()
+cd proactivity-main
+# In first PowerShell window:
+python -m src.drive.drive_improved --control test --session-id $env:PV_SESSION_ID --participantid 001 --environment city --secondary-task none --functionname "Adjust seat positioning" --modeltype combined --state-model xlstm --w-fcd 0.7
+
+# In second PowerShell window:
+uv run provoice session_id=$env:PV_SESSION_ID participantid=001 environment=city secondary_task=none functionname="Adjust seat positioning" modeltype=combined state_model=xlstm w_fcd=0.7
 ```
 
 ### Access Dashboard
@@ -132,6 +150,7 @@ The web UI dashboard displays real-time metrics and analysis.
 
 ```
 proactivity-main/
+├── start_both.py              # Launcher script (recommended for starting both processes)
 ├── src/
 │   ├── drive/                  # Driving simulation module
 │   │   ├── drive_improved.py   # Enhanced CARLA manual control
