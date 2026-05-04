@@ -4,6 +4,7 @@ import signal
 import sys
 import time
 import os
+import uuid
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -139,6 +140,7 @@ def main():
     modeltype = args.get("modeltype", "combined").lower()  # fcd | state | combined
     state_model = args.get("state_model", args.get("statemodel", "classic")).lower()
     w_fcd = float(args.get("w_fcd", "0.5"))
+    session_id = args.get("session_id") or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     window_sz = int(args.get("window", "256"))
     camera_source = args.get("camera_source", "front")
     camera_url = args.get("camera_url", "udp://127.0.0.1:8554")
@@ -250,13 +252,18 @@ def main():
 
     actuator = ProVoiceActuator()
     static_context = {
+        "session_id": session_id,
         "participantid": participantid,
         "environment": environment,
         "secondary_task": secondary_task,
         "functionname": functionname,
         "emotion": emotion,
+        "modeltype": modeltype,
+        "state_model": state_model,
+        "w_fcd": w_fcd,
     }
 
+    print(f"[main] session_id={session_id}")
     print(f"[main] Static context: {static_context}")
 
     # ---------------------------------------------------------------------

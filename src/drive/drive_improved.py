@@ -63,12 +63,14 @@ import argparse
 import collections
 import csv
 import datetime
+import json
 import logging
 import math
 import os
 import random
 import re
 import sys
+import uuid
 import weakref
 
 try:
@@ -134,12 +136,35 @@ DEFAULT_DECISION_COLUMNS = [
     'fallback_reason',
 ]
 
-USER_SELECTION_COLUMNS = [
+USER_LOA_LABEL_COLUMNS = [
+    'session_id',
+    'window_idx',
+    'window_start_ms',
+    'window_end_ms',
+    'window_start_timestamp',
+    'window_end_timestamp',
+    'selection_timestamp',
+    'selection_frame',
+    'selection_sim_time',
+    'selection_speed_kmh',
+    'participantid',
+    'environment',
+    'secondary_task',
+    'functionname',
+    'emotion',
+    'modeltype',
+    'state_model',
+    'w_fcd',
     'user_selected_loa',
-    'user_selection_timestamp',
-    'user_selection_frame',
-    'user_selection_sim_time',
-    'user_selection_speed_kmh',
+    'system_action',
+    'system_level',
+    'system_loa',
+    'system_message',
+    'system_probs',
+    'system_profile',
+    'system_fallback',
+    'system_fallback_reason',
+    'system_fcd',
 ]
 
 
@@ -192,6 +217,20 @@ def _read_csv_headers(path):
         return next(reader, [])
 
 
+def _read_last_csv_row(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            last = None
+            for row in reader:
+                last = row
+            return last or {}
+    except Exception:
+        return {}
+
+
 def _ensure_csv_columns(path, source_headers, added_headers):
     existing_headers = _read_csv_headers(path)
     headers = existing_headers[:] if existing_headers else source_headers[:]
@@ -216,21 +255,59 @@ def _ensure_csv_columns(path, source_headers, added_headers):
     return headers
 
 
+def _current_session_id(explicit_session_id=''):
+    return (explicit_session_id or os.getenv('PV_SESSION_ID') or f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}")
+
+
+def _load_latest_system_decision_snapshot(session_id=''):
+    cwd = os.getcwd()
+    path = os.path.join(cwd, 'data', 'decisions.csv')
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            last_match = None
+            last_any = None
+            for row in reader:
+                last_any = row
+                if session_id and row.get('session_id') not in (None, '', session_id):
+                    continue
+                last_match = row
+            chosen = last_match or last_any
+            if chosen:
+                chosen['_source_path'] = path
+                return chosen
+    except Exception:
+        return {}
+    return {}
+
+
+def _normalize_csv_value(value):
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    if value is None:
+        return ''
+    return value
+
+
 def append_user_loa_selection(selection_row):
     cwd = os.getcwd()
-    decision_path = os.path.join(cwd, 'data', 'decision.csv')
-    legacy_path = os.path.join(cwd, 'data', 'decisions.csv')
-    source_headers = _read_csv_headers(decision_path)
+    labels_path = os.path.join(cwd, 'data', 'user_loa_labels.csv')
+    source_headers = _read_csv_headers(labels_path)
     if not source_headers:
-        source_headers = _read_csv_headers(legacy_path)
-    if not source_headers:
-        source_headers = DEFAULT_DECISION_COLUMNS[:]
+        source_headers = USER_LOA_LABEL_COLUMNS[:]
 
-    headers = _ensure_csv_columns(decision_path, source_headers, USER_SELECTION_COLUMNS)
+    headers = _ensure_csv_columns(labels_path, source_headers, USER_LOA_LABEL_COLUMNS)
     row = {k: '' for k in headers}
-    row.update(selection_row)
+    for key, value in (selection_row or {}).items():
+        if key in row:
+            row[key] = _normalize_csv_value(value)
 
-    with open(decision_path, 'a', newline='') as f:
+    with open(labels_path, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writerow(row)
 
@@ -241,6 +318,13 @@ class LoASelectionPopup(object):
         self.next_prompt_ms = 0
         self.active = False
         self.prompt_started_ms = 0
+        self.session_started_ms = 0
+        self.session_started_walltime = None
+        self.window_idx = 0
+        self.window_start_ms = 0
+        self.window_end_ms = 0
+        self.window_start_timestamp = ''
+        self.window_end_timestamp = ''
         self.width = width
         self.height = height
         self._title_font = pygame.font.Font(pygame.font.get_default_font(), 30)
@@ -248,7 +332,10 @@ class LoASelectionPopup(object):
         self._small_font = pygame.font.Font(pygame.font.get_default_font(), 20)
 
     def start(self):
-        self.next_prompt_ms = pygame.time.get_ticks() + self.interval_ms
+        self.session_started_ms = pygame.time.get_ticks()
+        self.session_started_walltime = datetime.datetime.now()
+        self.window_idx = 0
+        self.next_prompt_ms = self.session_started_ms + self.interval_ms
 
     def should_open(self, now_ms):
         return (not self.active) and self.next_prompt_ms and now_ms >= self.next_prompt_ms
@@ -256,6 +343,12 @@ class LoASelectionPopup(object):
     def open(self, now_ms):
         self.active = True
         self.prompt_started_ms = now_ms
+        self.window_idx += 1
+        self.window_start_ms = max(self.session_started_ms, now_ms - self.interval_ms)
+        self.window_end_ms = now_ms
+        if self.session_started_walltime is not None:
+            self.window_start_timestamp = (self.session_started_walltime + datetime.timedelta(milliseconds=self.window_start_ms - self.session_started_ms)).isoformat(timespec='milliseconds')
+            self.window_end_timestamp = (self.session_started_walltime + datetime.timedelta(milliseconds=self.window_end_ms - self.session_started_ms)).isoformat(timespec='milliseconds')
 
     def close(self, now_ms):
         self.active = False
@@ -282,7 +375,7 @@ class LoASelectionPopup(object):
             (self._title_font, 'LoA Selection Required'),
             (self._text_font, 'Please choose the proper LoA for the last 20 seconds.'),
             (self._text_font, 'Press number key: 0, 1, 2, 3, or 4'),
-            (self._small_font, '0=Manual  1=Assist  2=Partial  3=Conditional  4=High automation'),
+            (self._small_font, '0=none  1=suggest  2=ask_approval  3=auto_with_veto  4=auto'),
         ]
 
         y = int(self.height * 0.35)
@@ -324,7 +417,7 @@ class StartScreenOverlay(object):
         overlay.fill((0, 0, 0))
         display.blit(overlay, (0, 0))
 
-        title = self._title_font.render('CARLA Manual Drive', True, (255, 255, 255))
+        title = self._title_font.render('ProActivity Experiment', True, (255, 255, 255))
         title_rect = title.get_rect(center=(self.width // 2, int(self.height * 0.35)))
         display.blit(title, title_rect)
 
@@ -1478,6 +1571,20 @@ def game_loop(args):
         loa_popup = LoASelectionPopup(args.width, args.height, interval_seconds=20)
         start_overlay = StartScreenOverlay(args.width, args.height)
         started = False
+        session_id = _current_session_id(getattr(args, 'session_id', ''))
+        label_context = {
+            'session_id': session_id,
+            'participantid': getattr(args, 'participantid', ''),
+            'environment': getattr(args, 'environment', ''),
+            'secondary_task': getattr(args, 'secondary_task', ''),
+            'functionname': getattr(args, 'functionname', 'Adjust seat positioning'),
+            'emotion': getattr(args, 'emotion', ''),
+            'modeltype': getattr(args, 'modeltype', ''),
+            'state_model': getattr(args, 'state_model', ''),
+            'w_fcd': getattr(args, 'w_fcd', ''),
+        }
+        print(f"[INFO] Drive session_id={session_id}")
+        print("[INFO] User LoA labels will be written to data/user_loa_labels.csv")
 
         if args.sync:
             sim_world.tick()
@@ -1528,12 +1635,28 @@ def game_loop(args):
                         player_velocity = world.player.get_velocity() if world and world.player else carla.Vector3D()
                         speed_kmh = 3.6 * math.sqrt(
                             player_velocity.x ** 2 + player_velocity.y ** 2 + player_velocity.z ** 2)
+                        system_snapshot = _load_latest_system_decision_snapshot(label_context['session_id'])
                         append_user_loa_selection({
+                            **label_context,
+                            'window_idx': loa_popup.window_idx,
+                            'window_start_ms': loa_popup.window_start_ms,
+                            'window_end_ms': loa_popup.window_end_ms,
+                            'window_start_timestamp': loa_popup.window_start_timestamp,
+                            'window_end_timestamp': loa_popup.window_end_timestamp,
+                            'selection_timestamp': datetime.datetime.now().isoformat(timespec='milliseconds'),
+                            'selection_frame': world.hud.frame if world else '',
+                            'selection_sim_time': round(world.hud.simulation_time, 3) if world else '',
+                            'selection_speed_kmh': round(speed_kmh, 2),
                             'user_selected_loa': selected_loa,
-                            'user_selection_timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-                            'user_selection_frame': world.hud.frame if world else '',
-                            'user_selection_sim_time': round(world.hud.simulation_time, 3) if world else '',
-                            'user_selection_speed_kmh': round(speed_kmh, 2),
+                            'system_action': system_snapshot.get('action', ''),
+                            'system_level': system_snapshot.get('level', ''),
+                            'system_loa': system_snapshot.get('LoA', system_snapshot.get('loa', '')),
+                            'system_message': system_snapshot.get('message', ''),
+                            'system_probs': system_snapshot.get('probs', ''),
+                            'system_profile': system_snapshot.get('profile', ''),
+                            'system_fallback': system_snapshot.get('fallback', ''),
+                            'system_fallback_reason': system_snapshot.get('fallback_reason', ''),
+                            'system_fcd': system_snapshot.get('fcd', system_snapshot.get('FCD', '')),
                         })
                         loa_popup.close(now_ms)
                 world.render(display)
@@ -1616,6 +1739,47 @@ def main():
         default=2.2,
         type=float,
         help='Gamma correction of the camera (default: 2.2)')
+    argparser.add_argument(
+        '--participantid',
+        default='',
+        help='participant id for label logging')
+    argparser.add_argument(
+        '--environment',
+        default='',
+        help='environment for label logging')
+    argparser.add_argument(
+        '--secondary-task',
+        dest='secondary_task',
+        default='',
+        help='secondary task for label logging')
+    argparser.add_argument(
+        '--functionname',
+        default='Adjust seat positioning',
+        help='function/task name for label logging')
+    argparser.add_argument(
+        '--emotion',
+        default='',
+        help='emotion label for label logging')
+    argparser.add_argument(
+        '--modeltype',
+        default='',
+        help='model type for label logging')
+    argparser.add_argument(
+        '--state-model',
+        dest='state_model',
+        default='',
+        help='state model name for label logging')
+    argparser.add_argument(
+        '--w-fcd',
+        dest='w_fcd',
+        default='',
+        type=float,
+        help='FCD weight for label logging')
+    argparser.add_argument(
+        '--session-id',
+        dest='session_id',
+        default='',
+        help='shared session id for aligning logs')
     argparser.add_argument(
         '--sync',
         action='store_true',

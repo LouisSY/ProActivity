@@ -86,6 +86,39 @@ python src/ProVoice/main.py \
   w_fcd=0.7
 ```
 
+### Logging and Training Data
+
+- `data/decisions.csv` is the **system decision log** written by ProVoice.
+- `data/user_loa_labels.csv` is the **user label log** written by the driving UI every 20 seconds.
+- `data/raw_data.jsonl` stores the raw multimodal context samples.
+
+For best alignment across the two processes, use the same `session_id` in both commands. A convenient way is to export `PV_SESSION_ID` once and pass it to both programs:
+
+```bash
+export PV_SESSION_ID=$(uuidgen)
+
+python -m src.drive.drive_improved \
+  --control test \
+  --session-id "$PV_SESSION_ID" \
+  --participantid 001 \
+  --environment city \
+  --secondary-task none \
+  --functionname "Adjust seat positioning" \
+  --modeltype combined \
+  --state-model xlstm \
+  --w-fcd 0.7
+
+uv run provoice \
+  session_id=$PV_SESSION_ID \
+  participantid=001 \
+  environment=city \
+  secondary_task=none \
+  functionname="Adjust seat positioning" \
+  modeltype=combined \
+  state_model=xlstm \
+  w_fcd=0.7
+```
+
 ### Access Dashboard
 
 Open your browser and navigate to:
@@ -114,7 +147,8 @@ proactivity-main/
 │       └── webui/               # Dashboard interface
 │
 ├── data/                       # Data storage
-│   ├── decisions.csv          # Decision logs
+│   ├── decisions.csv          # System decision logs
+│   ├── user_loa_labels.csv    # User LoA labels (every 20s)
 │   └── raw_data.jsonl         # Raw event data
 │
 ├── docs/                       # Documentation

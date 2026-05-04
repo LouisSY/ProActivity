@@ -1,0 +1,6 @@
+LoA Levels:
+- 0: action = none：No assistive action is taken.
+- 1: action = suggest：Give suggestion.
+- 2: action = ask_approval：Ask for user confirmation.
+- 3: action = auto_with_veto：Execute automatically but user can veto.
+- 4: action = auto：Fully automatic.

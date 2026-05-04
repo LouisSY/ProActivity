@@ -373,7 +373,12 @@ class DataCollector:
                     data['functionname'] = data.get('functionname', self.functionname)
                     action = self.decision_engine.decide(dict(data))
                     if self.logger and isinstance(action, dict):
-                        self.logger.log_processed(action)
+                        action_for_log = dict(action)
+                        for key in ('session_id', 'participantid', 'environment', 'secondary_task', 'functionname', 'emotion', 'modeltype', 'state_model', 'w_fcd'):
+                            value = data.get(key)
+                            if value not in (None, ''):
+                                action_for_log.setdefault(key, value)
+                        self.logger.log_processed(action_for_log)
                     data['last_action'] = action
 
 
