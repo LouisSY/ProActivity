@@ -6,8 +6,91 @@ import time
 import os
 import uuid
 import argparse as ap
+import json
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from ProVoice.study_bridge import DecisionBridge
+
+# Served xLSTM checkpoint when --xlstm-model is not given.
+DEFAULT_XLSTM_MODEL = "trained_models/state_xlstm.pt"
+
+# ── CPU thread budget ────────────────────────────────────────────────────────
+# Must run BEFORE numpy/torch/cv2 are imported: the OpenMP/MKL runtimes size
+# their thread pools once, at load time, and ignore these variables afterwards.
+#
+# Why cap them at all: this process shares the machine with the CARLA server and
+# the Drive client, and it holds NO tick of its own — the DataCollector only ever
+# reads (get_velocity, get_weather, a cached map), so it never owes the server
+# anything and is safe under either clock. An all-core burst here therefore does
+# not stall a tick; it starves CARLA's render and physics threads and Drive's
+# render loop directly, which the participant sees as dropped frames and laggy
+# steering. The cap is what stops this process from taking the whole machine.
+#
+# Under start_experiment.py --sync that cap matters MORE, not less. The clock is
+# then paced against the wall clock by src/drive/fixed_npc_traffic.py, and a
+# server starved of CPU cannot complete its fixed step in time — so instead of
+# degraded physics you get the whole simulation in slow motion, for the
+# participant and for every wall-clock-aligned signal recorded here.
+#
+# (Two earlier versions of this comment each asserted one clock as a permanent
+# fact — first synchronous, then asynchronous. Both are reachable; check the
+# --sync flag before relying on any claim about tick ownership.)
+#
+# Left at its default, torch sizes its intra-op pool to the core count (20 on
+# the lab machine) and every xLSTM forward becomes an all-core stampede.
+# Measured on a full 320-frame window:
+#
+#   threads   forward wall   cores busy
+#      20         5.6 ms        19.2      <- default
+#       4         3.6 ms         4.6
+#       2         5.1 ms         2.0      <- default here
+#       1         8.1 ms         1.0
+#
+# 20 threads buys NOTHING in wall-clock over 2 (the ops are tiny; fork/join
+# across 20 cores costs more than it saves) while consuming ~10x the CPU. At
+# decision_hz=4 that is four all-core bursts per second, which is exactly the
+# lag that appears once calibration ends and the decision thread starts running
+# full windows. KMP_BLOCKTIME/OMP_WAIT_POLICY stop the idle OpenMP workers
+# spin-waiting between bursts, which otherwise keeps the cores hot in between.
+PV_NUM_THREADS = os.getenv("PV_NUM_THREADS", "2")
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, PV_NUM_THREADS)
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# ── Crash diagnostics ────────────────────────────────────────────────────────
+# This process has died with STATUS_ACCESS_VIOLATION (0xC0000005 -> exit code
+# 3221225477) inside native code. A hard fault like that kills the interpreter
+# outright: no traceback, no excepthook, nothing on stdout past the last normal
+# print. faulthandler installs an OS-level handler that dumps the Python stack
+# of EVERY thread at the moment of the fault, which turns "PROVOICE exited with
+# code 3221225477" into a named file and line.
+#
+# Enabled here — before torch/cv2/mediapipe are imported — so a fault during
+# library init is covered too. The log is opened line-buffered and kept alive
+# for the whole process: faulthandler writes to the raw fd, so the object must
+# not be garbage-collected (hence the module-level name).
+_FAULT_LOG = None
+try:
+    import faulthandler
+    _log_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _fault_path = os.path.join(_log_dir, "provoice_faults.log")
+    _FAULT_LOG = open(_fault_path, "a", buffering=1, encoding="utf-8", errors="replace")
+    _FAULT_LOG.write(f"\n===== ProVoice start {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"pid={os.getpid()} =====\n")
+    faulthandler.enable(file=_FAULT_LOG, all_threads=True)
+    print(f"[main] faulthandler active -> {_fault_path}")
+except Exception as _e:
+    print(f"[main] could not enable faulthandler: {_e}")
 
 import uvicorn
 
@@ -28,6 +111,32 @@ from ProVoice.decision_engine import (
 )
 from ProVoice.provoice_actuator import ProVoiceActuator
 import ProVoice.webui.app as dashboard
+
+# The env vars above configure the OpenMP/MKL runtimes; these are torch's own
+# knobs and are authoritative for intra-op (per-operator) and inter-op parallelism.
+# Set here, after the imports that pull torch in, because torch is not imported
+# directly by this module. set_num_interop_threads() throws once any inter-op
+# work has started, so a failure is non-fatal and simply leaves the default.
+try:
+    import torch as _torch
+    _torch.set_num_threads(int(PV_NUM_THREADS))
+    try:
+        _torch.set_num_interop_threads(int(PV_NUM_THREADS))
+    except Exception:
+        pass
+    print(f"[main] torch CPU threads capped at {_torch.get_num_threads()} "
+          f"(PV_NUM_THREADS={PV_NUM_THREADS}) to leave cores for CARLA.")
+except Exception as _e:
+    print(f"[main] could not cap torch threads: {_e}")
+
+try:
+    import cv2 as _cv2
+    # OpenCV runs its own thread pool, independent of OpenMP's. At 640x480 the
+    # colour conversions and resizes on the capture path are single-thread work
+    # anyway, so this costs nothing and removes another all-core consumer.
+    _cv2.setNumThreads(int(PV_NUM_THREADS))
+except Exception as _e:
+    print(f"[main] could not cap OpenCV threads: {_e}")
 
 # import ProVoice.logo as logo
 
@@ -74,6 +183,55 @@ def _normalize_argv(tokens):
     return out
 
 
+# ── Camera selection ─────────────────────────────────────────────────────────
+# There is no camera *identity* anywhere in this pipeline: DataCollector passes
+# whatever it is given straight to cv2.VideoCapture, and an index means only
+# "the n-th device this OpenCV backend enumerated". On the study machine that
+# order puts the built-in camera at 0 and the external USB webcam at 1, so
+# --webcam is exactly "use index 1" -- no probing, no fallback. If the machine
+# ever enumerates differently, pin the device with camera_source=N instead.
+_WEBCAM_INDEX = 1
+
+
+def _check_camera_index(index: int) -> str:
+    """``""`` if ``index`` opens AND delivers a frame, else why it didn't.
+
+    Both halves matter. cv2.VideoCapture does not raise on a missing device and
+    an index that is merely *claimed* by a driver can still return nothing, so
+    isOpened() alone would pass a camera that yields no frames -- DataCollector
+    would keep visual_enabled=True and run the whole session blind.
+
+    Checked through the SAME (default) backend DataCollector opens with: an
+    index is only meaningful relative to a backend, and on Windows MSMF and
+    DSHOW enumerate devices separately, so checking with one and opening with
+    the other can land on a different physical camera.
+    """
+    try:
+        import cv2
+    except Exception as e:  # noqa: BLE001 — no OpenCV means no camera at all
+        return f"OpenCV is unavailable ({e})"
+
+    cap = None
+    try:
+        cap = cv2.VideoCapture(index)
+        if not cap.isOpened():
+            return "no device answered at that index"
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return "the device opened but returned no frame"
+        return ""
+    except Exception as e:  # noqa: BLE001 — a bad index must not crash startup
+        return f"opening it raised {e!r}"
+    finally:
+        if cap is not None:
+            cap.release()
+        # This just closed the device DataCollector is about to open, and
+        # Windows does not always free a capture device the instant release()
+        # returns. The gap between here and cv2.VideoCapture() downstream is a
+        # few milliseconds, so give the driver a moment rather than racing it.
+        time.sleep(1.0)
+
+
 def _build_parser() -> ap.ArgumentParser:
     p = ap.ArgumentParser(
         prog="ProVoice.main",
@@ -86,34 +244,139 @@ def _build_parser() -> ap.ArgumentParser:
     p.add_argument("--functionname", default="Adjust seat positioning")
     p.add_argument("--emotion", "--affect", dest="emotion", default="")
     p.add_argument("--modeltype", default="combined",
-                   help="fcd | state | combined | collection")
-    p.add_argument("--state-model", "--statemodel", dest="state_model", default="classic",
+                   choices=("fcd", "state", "combined", "collection"),
+                   help="fcd | state | combined | collection. NOTE 'xlstm' is "
+                        "NOT one of them: the xLSTM is a STATE model, so serving "
+                        "it alone is --modeltype state --state-model xlstm. "
+                        "Constrained because it was not: --modeltype xlstm was "
+                        "accepted silently, fell through to 'combined', and a "
+                        "run that asked for the xLSTM alone was served "
+                        "0.7*FCD + 0.3*xLSTM instead (2026-08-21).")
+    p.add_argument("--state-model", "--statemodel", dest="state_model", default="xlstm",
                    help="classic | xlstm")
     p.add_argument("--w-fcd", dest="w_fcd", type=float, default=0.7)
     p.add_argument("--session-id", dest="session_id", default=None)
+    p.add_argument("--traffic-seed", dest="traffic_seed", type=int, default=None,
+                   help="Traffic scenario this session is running, recorded on "
+                        "every raw_data.jsonl frame. Set by start_experiment.py "
+                        "on a local run; under --remote the CARLA machine "
+                        "publishes it at the bridge's /session and this is left "
+                        "unset. Unset is logged as null -- nothing else in the "
+                        "data identifies the scenario, so a null column means "
+                        "that session cannot be split out by traffic later.")
     p.add_argument("--window", type=int, default=400,
                    help="Frame-count cap on the model input window (safety bound).")
     p.add_argument("--window-seconds", dest="window_seconds", type=float, default=None,
                    help="Time span (s) of the xLSTM window; unset inherits the checkpoint's.")
+    p.add_argument("--decision-hz", dest="decision_hz", type=float, default=4.0,
+                   help="Rate of the decision thread, decoupled from data collection. "
+                        "Sets the decisions.csv row rate; capped by the achieved "
+                        "collection rate (one decision per distinct frame).")
     p.add_argument("--camera-source", dest="camera_source", default="front")
     p.add_argument("--camera-url", dest="camera_url", default="udp://127.0.0.1:8554")
+    p.add_argument("--webcam", action="store_true",
+                   help="Use camera index %d — the external USB webcam, where 0 is "
+                        "the built-in one. Startup FAILS if that index does not "
+                        "deliver a frame, rather than recording a blind session. "
+                        "Only fills in for the DEFAULT camera source; an explicit "
+                        "camera_source= still wins." % _WEBCAM_INDEX)
     p.add_argument("--vehicle-id", dest="vehicle_id", default=None,
                    help="Skip vehicle_id.txt discovery when set.")
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=2000)
     p.add_argument("--carla-timeout", dest="carla_timeout", type=float, default=10.0)
     p.add_argument("--vehicle-state-url", dest="vehicle_state_url", default=None)
+    p.add_argument("--vehicle-state-file", dest="vehicle_state_file", default=None,
+                   help="Path published by scripts/vehicle_state_file_bridge.py. "
+                        "Like --vehicle-state-url it means THIS process makes no "
+                        "CARLA calls at all, but it reads a file instead of a "
+                        "socket, keeping the network stack out of the loop.")
+    p.add_argument("--xlstm-model", dest="xlstm_model",
+                   default=DEFAULT_XLSTM_MODEL,
+                   help="Path to the xLSTM checkpoint to SERVE (default: "
+                        "%(default)s). The live study points this at a "
+                        "per-participant, per-condition head under "
+                        "trained_models/user_study/, which is the only thing "
+                        "that differs between its three blocks -- so this is "
+                        "the study's independent variable, arriving as a "
+                        "filename.")
+    p.add_argument("--study-bridge", dest="study_bridge", action="store_true",
+                   help="Publish every LoA decision to the CARLA machine over "
+                        "the status bridge, for the live follow-up study. The "
+                        "drive process reads the latest one at the instant a "
+                        "call fires; it loads no model of its own. Needs a "
+                        "reachable --status-url (implied by --remote). Off by "
+                        "default: outside the study nothing reads this feed, "
+                        "and it is 4 POSTs a second for the whole session.")
+    p.add_argument("--study-checkpoint-id", dest="study_checkpoint_id", default="",
+                   help="Identifier of the served head, recorded with every "
+                        "published decision and written into the drive's "
+                        "call_events.csv -- it is what ties a call back to the "
+                        "exact model that produced its LoA. Leave unset: it is "
+                        "derived automatically from --xlstm-model's filename "
+                        "(the resolved one, after any --remote bridge "
+                        "adoption), which already IS the checkpoint's identity "
+                        "under the trained_models/user_study/ naming "
+                        "convention. Only pass this explicitly to label an ad "
+                        "hoc checkpoint outside that convention.")
+    p.add_argument("--status-url", dest="status_url", default=None,
+                   help="Reverse bridge on the CARLA machine "
+                        "(scripts/provoice_status_server.py): this process posts "
+                        "'collection_started' at its first logged frame and "
+                        "'provoice_ended' when it exits, so Drive over there "
+                        "knows when to open its LoA windows and when to stop the "
+                        "car. Normally left unset and adopted from the vehicle "
+                        "bridge's /session.")
+    p.add_argument("--bridge-session-timeout", dest="bridge_session_timeout",
+                   type=float, default=10.0,
+                   help="How long to wait for the remote bridge to publish a "
+                        "session id AND a participant id at /session. Only used "
+                        "with vehicle_state_url. A bridge that answers with "
+                        "neither is still starting up, so that counts as not "
+                        "answered. 0 skips the fetch entirely, leaving both "
+                        "exactly as given here.")
+    p.add_argument("--state-poll-hz", dest="state_poll_hz", type=float, default=2.0,
+                   help="How often to poll vehicle_state_url. The 2 Hz default "
+                        "is the historical one; start_experiment.py --vehicle-bridge "
+                        "raises it to match the collection loop, because at 2 Hz "
+                        "steer/brake are sampled ten times slower than a direct "
+                        "CARLA read and are visibly degraded.")
     p.add_argument("--log-path", dest="log_path", default=None,
                    help="JSONL log of features fed to the xLSTM; unset disables.")
+    p.add_argument("--calibration-only", dest="calibration_only", action="store_true",
+                   help="Run the 180 s calibration, store the baseline for this "
+                        "participant, then exit. Always measures fresh, ignoring any "
+                        "stored calibration.")
+    p.add_argument("--data-collection", dest="data_collection", action="store_true",
+                   help="Data-collection run: record raw data only. No decision engine "
+                        "is loaded or run, and the live calibration is skipped (this "
+                        "participant's stored baseline is reused, or neutral defaults "
+                        "if there is none). Mutually exclusive with --calibration-only.")
+    p.add_argument("--data-collection-timeout", dest="data_collection_timeout",
+                   type=float, default=None,
+                   help="Hard wall-clock limit, in seconds, on a --data-collection run. "
+                        "Once it elapses this process stops itself exactly as "
+                        "--calibration-only does when its baseline finishes: the "
+                        "collector is stopped and 'provoice_ended' is posted to "
+                        "status_url (see _calibration_finished / the shutdown finally "
+                        "block), which is what makes Drive show its end-of-session "
+                        "screen on a --remote run. Ignored without --data-collection. "
+                        "Set by start_experiment.py's --experiment-data-collection-"
+                        "provoice-remote preset (900 = 15 min); unset otherwise.")
     return p
 
 
 def _parse_args(argv):
-    args, unknown = _build_parser().parse_known_args(_normalize_argv(argv))
+    parser = _build_parser()
+    args, unknown = parser.parse_known_args(_normalize_argv(argv))
     if unknown:
         # Surface stray tokens instead of silently dropping them (the old
         # key=value parser ignored anything without an '=').
         print(f"[main] ignoring unrecognized argument(s): {unknown}")
+    if args.calibration_only and args.data_collection:
+        parser.error("--calibration-only and --data-collection are mutually "
+                     "exclusive: one runs the calibration and nothing else, the "
+                     "other skips it and only records data.")
     return args
 
 def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int | None:
@@ -154,6 +417,314 @@ def read_vehicle_id(path: str | None = None, wait_seconds: float = 10.0) -> int 
     return None
 
 
+def _as_int(value) -> "int | None":
+    """int(value), or None for anything that is not one.
+
+    Separate from the `or None` normalisation used for the id strings because
+    0 is a legitimate seed and `0 or None` is None.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_bridge_session(url: str, timeout: float = 10.0,
+                         request_timeout: float = 3.0) -> dict | None:
+    """Wait up to ``timeout`` for {session_id, participantid} from /session.
+
+    In a --remote run the launcher on the CARLA machine mints the session id and
+    holds the participant id, and THIS process has to agree with both or the
+    session's LoA labels and raw frames end up filed under different names. The
+    bridge publishes them; this reads them back, so neither id depends on a
+    human retyping it into a second terminal.
+
+    It waits for the IDS, not merely for the endpoint. Those are different
+    events: the bridge starts serving as soon as its socket is open, and a
+    /session that answers 200 with two nulls is a bridge that is up but does not
+    yet know who is driving. Returning on the first answer would take those
+    nulls as the truth and mint a local session id a second later — the exact
+    split-identity failure this function exists to prevent. So a nulls-only
+    answer is treated like no answer at all and polled again.
+
+    The wait also covers the ordinary case of the two machines being started by
+    hand, in either order: a ProVoice launched first would otherwise get one
+    refused connection and fall back for the rest of the session. This runs
+    ONCE, at startup, so a plain urlopen is right here — the keep-alive
+    machinery in DataCollector exists for the 2 Hz state poll, not for this.
+
+    Returns None when the bridge never answered at all, or answered with
+    something unusable (a bridge predating this route 404s). None means "no
+    information", never "no session": the caller keeps whatever it already had.
+    A partial answer at the deadline is returned as-is rather than discarded —
+    one id is better than none, and the caller says out loud what is missing.
+    """
+    endpoint = url.rstrip("/") + "/session"
+    deadline = time.monotonic() + max(0.0, timeout)
+    attempt = 0
+    last_err: str | None = None
+    last_info: dict | None = None
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(endpoint, timeout=request_timeout) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                info = json.loads(resp.read())
+            if not isinstance(info, dict):
+                raise ValueError(f"expected an object, got {type(info).__name__}")
+            last_info = {
+                # Normalize "" to None here so the caller has one "unknown".
+                "session_id": (info.get("session_id") or None),
+                "participantid": (info.get("participantid") or None),
+                "status_url": (info.get("status_url") or None),
+                "xlstm_model": (info.get("xlstm_model") or None),
+                # Which traffic scenario the CARLA machine is running. Same
+                # channel and same reason as the ids: the value exists only on
+                # that machine, and a human retyping it into this terminal is
+                # the failure mode /session was added to remove. NOT part of
+                # the readiness test below -- a bridge that knows both ids is
+                # ready even if it predates this field, and blocking on it
+                # would turn an older bridge into a startup hang.
+                "traffic_seed": _as_int(info.get("traffic_seed")),
+            }
+            if last_info["session_id"] and last_info["participantid"]:
+                return last_info
+            last_err = ("bridge is up but has published no %s yet"
+                        % (" or ".join(
+                            k for k in ("session_id", "participantid")
+                            if not last_info[k])))
+        except urllib.error.HTTPError as e:
+            # A routed answer, just not this route: the bridge is older than
+            # this feature. Retrying cannot change that, so stop immediately.
+            print(f"[bridge] {endpoint} -> HTTP {e.code}; this bridge does not "
+                  f"publish session identity. Using the local command line.")
+            return None
+        except Exception as e:  # noqa: BLE001 — startup convenience, never fatal
+            last_err = f"{type(e).__name__}: {e}"
+        if time.monotonic() >= deadline:
+            break
+        if attempt == 1:
+            print(f"[bridge] waiting up to {timeout:.0f}s for the session ids at "
+                  f"{endpoint} ({last_err}) ...")
+        time.sleep(1.0)
+
+    if last_info is not None:
+        # Answered, but never with both ids. Hand back what there was: status_url
+        # alone is still worth having, and resolve_session_identity() reports
+        # each missing id where the operator will see it.
+        print(f"[bridge] {endpoint} did not publish both ids within "
+              f"{timeout:.0f}s ({last_err}).")
+        return last_info
+    print(f"[bridge] {endpoint} did not answer within {timeout:.0f}s "
+          f"({last_err}). Using the local command line.")
+    return None
+
+
+def _status_channel_alive(status_url: str, timeout: float = 2.0) -> bool:
+    """Can this process actually reach the reverse bridge? One cheap GET."""
+    try:
+        with urllib.request.urlopen(status_url.rstrip("/") + "/health",
+                                    timeout=timeout) as resp:
+            resp.read()
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 — unreachable is the answer, not an error
+        return False
+
+
+def resolve_status_url(status_url: str, vehicle_state_url: str | None,
+                       timeout: float = 2.0) -> str | None:
+    """Confirm the reverse bridge is reachable, repairing the host if it is not.
+
+    The address published at /session is built on the CARLA machine from ITS
+    idea of its own IP. That is a guess, and it is wrong in two setups that
+    both look fine until the moment it matters:
+
+      * a tunnel (ngrok) in front of the vehicle bridge — the ProVoice machine
+        reaches the tunnel, never the LAN address behind it;
+      * a CARLA machine with several NICs (Hyper-V, VPN adapters), where the
+        interface that routes to 8.8.8.8 is not the one this machine talks to.
+
+    Either way the POST is dropped rather than refused, so it fails by TIMEOUT,
+    and the failure that matters is provoice_ended — sent while the process is
+    exiting, with nothing left to retry and a participant still driving.
+
+    So: probe it now. If the published address does not answer, try the host
+    this process demonstrably reaches the vehicle bridge on, with the published
+    port. That covers the multi-NIC case exactly and the LAN-address-behind-a-
+    tunnel case whenever the status port is exposed the same way.
+
+    Returns a URL that answered, or None. None is not fatal anywhere — it means
+    the operator gets told NOW, at startup, instead of at shutdown.
+    """
+    if not status_url:
+        return None
+    if _status_channel_alive(status_url, timeout):
+        print(f"[status] reverse bridge reachable at {status_url}")
+        return status_url
+
+    print(f"[status] {status_url} did not answer /health within {timeout:.0f}s.")
+    candidate = None
+    if vehicle_state_url:
+        published = urllib.parse.urlsplit(status_url)
+        reached = urllib.parse.urlsplit(vehicle_state_url)
+        if published.port and reached.hostname and \
+                reached.hostname != published.hostname:
+            candidate = f"{reached.scheme}://{reached.hostname}:{published.port}"
+            print(f"[status] trying {candidate} instead — that is the host this "
+                  f"process actually reaches the vehicle bridge on.")
+            if _status_channel_alive(candidate, timeout):
+                print(f"[status] reverse bridge reachable at {candidate}; using it.")
+                return candidate
+
+    print("[status] NO reverse channel. This run will still record everything, "
+          "but the CARLA machine will not learn when it starts or ends: Drive "
+          "there falls back to its popup-wait timeout and must be stopped by "
+          "hand. Fix by allowing the status port inbound on the CARLA machine, "
+          "or — behind a tunnel — by exposing it too and passing "
+          "status_url=<that url> here.")
+    return None
+
+
+def post_status_event(status_url: str, event: str, session_id: str,
+                      participantid: str, reason: str = "",
+                      timeout: float = 3.0, attempts: int = 2) -> bool:
+    """Tell the CARLA machine that collection started, or that we are done.
+
+    The receiver is scripts/provoice_status_server.py; Drive on that machine
+    polls the file it publishes. Both signals are ONE-SHOT and nothing replays
+    them, so each is retried briefly -- but never for long, because both are
+    sent from paths that must not stall: the first from the collection loop,
+    the second from process shutdown.
+
+    Returns whether the server acknowledged. Failure is logged and swallowed:
+    ProVoice's job is to record this participant's data, and it must not lose a
+    session because the other machine's status port was unreachable. The visible
+    cost of a lost signal is on the other end -- Drive falls back to its timeout
+    for the start, and to the operator for the end.
+    """
+    if not status_url:
+        return False
+    endpoint = status_url.rstrip("/") + "/event"
+    body = json.dumps({
+        "event": event,
+        "session_id": session_id or "",
+        "participantid": participantid or "",
+        "reason": reason,
+        "ts": time.time(),
+    }).encode("utf-8")
+    last = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            req = urllib.request.Request(
+                endpoint, data=body, method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    resp.read()
+                    print(f"[status] {event} acknowledged by {endpoint}")
+                    return True
+                last = f"HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            # 409 is the server telling us we are the wrong session. Retrying
+            # cannot fix that, and it is worth saying loudly: it means two
+            # sessions are live and one of them is talking to the wrong machine.
+            detail = e.read().decode("utf-8", "replace")[:200]
+            print(f"[status] {event} REJECTED by {endpoint}: HTTP {e.code} {detail}")
+            return False
+        except Exception as e:  # noqa: BLE001 — never fatal, see the docstring
+            last = f"{type(e).__name__}: {e}"
+        if attempt < attempts:
+            time.sleep(0.5)
+    print(f"[status] could not deliver {event} to {endpoint} ({last}). "
+          + ("Drive will fall back to its popup-wait timeout."
+             if event == "collection_started"
+             else "The other machine will NOT show the end-of-session screen; "
+                  "stop the drive there by hand."))
+    return False
+
+
+def resolve_session_identity(session_id_local: str | None,
+                             participantid_local: str | None,
+                             bridge: dict | None) -> tuple[str | None, str | None]:
+    """Reconcile this machine's ids with the ones the bridge publishes.
+
+    Rules, and why:
+
+    * bridge value, nothing local  -> adopt it. This is the point of the whole
+      exercise: `vehicle_state_url=...` alone is enough to join the session.
+    * local value, no bridge value -> keep it. An unreachable or older bridge
+      must not take a run down; that is the same isolation contract the state
+      poller works under (see DataCollector._poll_vehicle_state).
+    * both, and they AGREE         -> fine, and say so, since "the two machines
+      agree" is exactly what the operator wants confirmed.
+    * both, and they DISAGREE      -> raise. Not a bridge failure but an
+      operator error, with two authoritative-looking answers and no way to pick
+      one. Continuing writes this session's data under a name that does not
+      match the LoA labels on the other machine, and nothing downstream would
+      notice. Stopping costs seconds; the alternative costs the session.
+    """
+    resolved = []
+    for field, local in (("session_id", session_id_local),
+                         ("participantid", participantid_local)):
+        remote = (bridge or {}).get(field)
+        local = local or None
+        if remote and local and remote != local:
+            raise SystemExit(
+                f"[FATAL] {field} mismatch: this command line says {local!r}, the "
+                f"vehicle-state bridge says {remote!r}. Those are two different "
+                f"sessions and only one of them matches the LoA labels being "
+                f"recorded on the CARLA machine. Fix the command line, or drop "
+                f"{field} from it and let the bridge supply it "
+                f"(bridge_session_timeout=0 skips the check entirely).")
+        if remote and not local:
+            print(f"[bridge] adopting {field}={remote!r} from the bridge.")
+            resolved.append(remote)
+        else:
+            if remote and local:
+                print(f"[bridge] {field}={local!r} confirmed by the bridge.")
+            resolved.append(local)
+    return resolved[0], resolved[1]
+
+
+def resolve_traffic_seed(local: "int | None",
+                         bridge: dict | None) -> "int | None":
+    """Same reconciliation as the ids above, for the traffic scenario.
+
+    Kept separate rather than folded into resolve_session_identity because the
+    seed is an int (0 is a valid value, so the `or None` idiom there is wrong
+    for it) and because a missing seed is survivable where a missing session id
+    is not -- this returns None and lets the run continue with a null column,
+    while a disagreement still stops the session.
+
+    A DISAGREEMENT is fatal for the same reason an id mismatch is: the two
+    machines would be describing the same session differently, and the copy
+    that lands in raw_data.jsonl is the one used to split the corpus by
+    scenario. Training on a mislabelled scenario is not recoverable and not
+    detectable after the fact.
+    """
+    remote = (bridge or {}).get("traffic_seed")
+    if remote is not None and local is not None and remote != local:
+        raise SystemExit(
+            f"[FATAL] traffic_seed mismatch: this command line says {local}, the "
+            f"vehicle-state bridge says {remote}. The CARLA machine is the one "
+            f"actually running the traffic, so its value is the true one -- drop "
+            f"--traffic-seed from this command line and let the bridge supply it.")
+    if remote is not None and local is None:
+        print(f"[bridge] adopting traffic_seed={remote} from the bridge.")
+        return remote
+    if remote is not None and local is not None:
+        print(f"[bridge] traffic_seed={local} confirmed by the bridge.")
+        return local
+    if local is None:
+        print("[bridge] no traffic_seed from the bridge or the command line; "
+              "raw_data.jsonl will record it as null. Nothing else identifies "
+              "which traffic scenario this session ran.")
+    return local
+
+
 def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 2000, timeout: float = 2.0, retries: int = 5):
     """
     Connect to CARLA and return the actor (or None).
@@ -163,7 +734,7 @@ def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 
     """
     if not HAS_CARLA:
         print("[WARN] CARLA python API not available in this process.")
-        return None
+        return None, None, None
     for attempt in range(1, retries + 1):
         try:
             client = carla.Client(host, port)
@@ -172,18 +743,26 @@ def get_carla_vehicle_by_id(actor_id: int, host: str = "127.0.0.1", port: int = 
             actor = world.get_actor(actor_id)
             if actor is None:
                 print(f"[WARN] No actor with id {actor_id} in CARLA world.")
-                return None
+                return None, None, None
             if not actor.type_id.startswith("vehicle"):
                 print(f"[WARN] Actor {actor_id} is not a vehicle (type: {actor.type_id})")
             else:
                 print(f"[INFO] Connected to CARLA vehicle actor id={actor_id} type={actor.type_id}")
-            return actor
+            # The client and world are returned, NOT dropped on the floor.
+            # Previously both were locals and only the actor escaped, so the
+            # objects owning the RPC connection lost their last Python
+            # reference the moment this function returned and were left to the
+            # garbage collector, while the actor kept being used for the whole
+            # session. CARLA's documented usage is to keep the client alive for
+            # as long as anything obtained from it is in use; the caller now
+            # holds all three for the process lifetime.
+            return actor, client, world
         except (NotImplementedError, RuntimeError, UnicodeDecodeError) as e:
             print(f"[WARN] CARLA connect attempt {attempt}/{retries} failed ({type(e).__name__}): {e}")
             if attempt < retries:
                 time.sleep(1.0)
     print(f"[WARN] Could not connect to CARLA after {retries} attempts. Running without vehicle actor.")
-    return None
+    return None, None, None
 
 
 
@@ -196,8 +775,23 @@ def main():
     emotion = args.emotion
     modeltype = args.modeltype.lower()  # fcd | state | combined | collection
     state_model = args.state_model.lower()
+    # Resolved here, once, so both StateXLSTM construction sites below and the
+    # study bridge's checkpoint id all name the SAME file.
+    # Provisional: under --remote the bridge may replace this below, so the
+    # existence check waits until the path is settled.
+    xlstm_model_path = getattr(args, "xlstm_model", None) or DEFAULT_XLSTM_MODEL
     w_fcd = args.w_fcd
-    session_id = args.session_id or os.getenv("PV_SESSION_ID") or f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    # Everything the operator supplied HERE, before any fallback. PV_SESSION_ID
+    # counts as supplied: on this machine only start_experiment.py sets it, and
+    # it is just as authoritative (and just as wrong, if it disagrees with the
+    # other machine) as the flag. The generated id, by contrast, must not be
+    # invented until the bridge has had its say, or the adoption below could
+    # never happen.
+    session_id = args.session_id or os.getenv("PV_SESSION_ID") or None
+    # Not `or None`: 0 is a valid seed. Stays None when unset so the bridge can
+    # supply it below and, failing that, so the null in raw_data.jsonl is honest
+    # about nobody having said which scenario ran.
+    traffic_seed = args.traffic_seed
     window_sz = args.window  # frame-count cap on the model input (safety bound)
     # Time span (seconds) of the window fed to the xLSTM. Unset = inherit the
     # window the checkpoint was trained with (falling back to 20 s for legacy
@@ -206,11 +800,130 @@ def main():
     window_seconds = args.window_seconds
     camera_source = args.camera_source
     camera_url = args.camera_url
+    webcam = args.webcam
     vehicle_id_arg = args.vehicle_id  # optional: skip file-based discovery when set
     host = args.host
     port = args.port
     carla_timeout = args.carla_timeout
     vehicle_state_url = args.vehicle_state_url  # e.g. http://0.tcp.ngrok.io:PORT
+    vehicle_state_file = args.vehicle_state_file  # local file bridge (preferred)
+
+    # --- Session identity, from the remote bridge when there is one ----------
+    # Only the HTTP bridge: it is the one that spans two machines, and so the
+    # only one where the ids can drift apart. The file bridge runs beside a
+    # launcher that already sets both.
+    status_url = args.status_url
+    if vehicle_state_url and args.bridge_session_timeout > 0:
+        bridge = fetch_bridge_session(vehicle_state_url,
+                                      timeout=args.bridge_session_timeout)
+        session_id, participantid = resolve_session_identity(
+            session_id, participantid, bridge)
+        traffic_seed = resolve_traffic_seed(traffic_seed, bridge)
+        # The reverse channel is an ADDRESS, not an identity: two spellings of
+        # the same endpoint are not a session mismatch, so this adopts rather
+        # than reconciling. An explicit --status-url still wins, which is what
+        # makes a tunnel in front of the status server possible.
+        if not status_url and (bridge or {}).get("status_url"):
+            status_url = bridge["status_url"]
+            print(f"[status] adopting status_url={status_url!r} from the bridge.")
+        # Same treatment for the study's served checkpoint: adopted from the
+        # bridge unless the operator named one. The CARLA machine chose it from
+        # --participantid and --condition, and it is the ONLY thing that differs
+        # between the three blocks -- so having this end pick its own would mean
+        # the two halves running different conditions with nothing to show for
+        # it afterwards.
+        if (bridge or {}).get("xlstm_model"):
+            if args.xlstm_model and args.xlstm_model != DEFAULT_XLSTM_MODEL:
+                if args.xlstm_model != bridge["xlstm_model"]:
+                    print(f"[main] WARNING xLSTM model MISMATCH: this machine "
+                          f"was told {args.xlstm_model!r}, the bridge publishes "
+                          f"{bridge['xlstm_model']!r}. Keeping the explicit one "
+                          f"-- but one of the two ends is running the wrong "
+                          f"condition.")
+            else:
+                xlstm_model_path = bridge["xlstm_model"]
+                print(f"[main] adopting xlstm_model={xlstm_model_path!r} "
+                      f"from the bridge.")
+                if not os.path.exists(xlstm_model_path):
+                    print(f"[main] WARNING that checkpoint does NOT EXIST on "
+                          f"this machine. It is named by the CARLA machine but "
+                          f"must be present HERE -- copy it before the session.")
+
+    # --- The served checkpoint's identifier, for the study bridge -----------
+    #
+    # --study-checkpoint-id has always been read at the DecisionBridge call
+    # site below, but nothing ever SET it under --remote: the
+    # --study-satisfaction-provoice-remote preset (start_experiment.py) takes
+    # no participant, condition or model path on purpose -- all three are meant
+    # to arrive from this machine adopting xlstm_model_path above -- and that
+    # preset never passes --study-checkpoint-id either. So every
+    # call_events.csv row on the CARLA machine was logging checkpoint_id="",
+    # for every block, with nothing to say which file actually served it.
+    # (Found auditing the 2026-08-25 trial run; both real blocks used the
+    # correct model per decisions.csv's LoA/level/action mapping and the
+    # absence of any fallback row -- this was a missing LOG, not a wrong
+    # SERVE.)
+    #
+    # Derived from xlstm_model_path itself rather than published separately by
+    # the bridge: xlstm_model_path is already the single resolved fact (operand
+    # explicit flag, or bridge-adopted, in that priority), so deriving from it
+    # cannot disagree with what was actually loaded -- a second published field
+    # could drift from the first if only one of the two were updated.
+    #
+    # An explicit --study-checkpoint-id still wins outright. That is the escape
+    # hatch for a checkpoint whose filename does not carry the information an
+    # analyst needs (e.g. running an ad hoc file outside the
+    # trained_models/user_study/xlstm_p<pid>_k<n>.pt convention) --
+    # participant/condition/K are exactly what that convention's filename
+    # already encodes, so the derived form is the right default rather than a
+    # placeholder pending something better.
+    study_checkpoint_id = args.study_checkpoint_id
+    if not study_checkpoint_id and xlstm_model_path:
+        study_checkpoint_id = os.path.splitext(
+            os.path.basename(xlstm_model_path))[0]
+        if getattr(args, "study_bridge", False):
+            print(f"[main] study_checkpoint_id={study_checkpoint_id!r} "
+                  f"(derived from xlstm_model_path; pass "
+                  f"--study-checkpoint-id to override).")
+        # Probed here rather than trusted: an address that only fails at
+        # shutdown fails at the one moment nothing can be done about it.
+        if args.status_url:
+            # Hand-typed, so it is checked but never replaced — an operator
+            # naming a tunnel outranks anything derivable from the bridge host.
+            if not _status_channel_alive(status_url):
+                print("[status] the status_url given on the command line did "
+                      "not answer /health. Keeping it, since it was given "
+                      "explicitly, but the signals will not arrive unless it "
+                      "becomes reachable.")
+        elif status_url:
+            status_url = resolve_status_url(status_url, vehicle_state_url)
+
+    # Last resort, after the bridge has had its chance: a local run, or a bridge
+    # that published nothing. A generated id keeps this session's rows
+    # self-consistent even though nothing else shares it.
+    if not session_id:
+        session_id = f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        if vehicle_state_url:
+            print(f"[WARN] No session id from the command line or the bridge; "
+                  f"generated {session_id}. This machine's raw_data.jsonl will "
+                  f"NOT share a session id with the LoA labels recorded on the "
+                  f"CARLA machine — they can still be joined on timestamps, but "
+                  f"check this is what you meant before driving.")
+    participantid = participantid or ""
+    if args.calibration_only and not participantid:
+        # The baseline is filed as calibration_<participantid>.json, so with no
+        # id DataCollector.save_calibration() finds no path and drops it with a
+        # warning — after the full 180 s measurement. Refuse up front instead:
+        # the whole run would otherwise produce nothing, and the operator would
+        # only learn that at the end of it.
+        raise SystemExit(
+            "[FATAL] --calibration-only with no participant id: the baseline is "
+            "stored per participant, so this run would measure for 180 s and "
+            "then have nowhere to save. Pass participantid=..., or point "
+            "vehicle_state_url at a bridge that publishes one at /session.")
+    if vehicle_state_url and not participantid:
+        print("[WARN] No participant id from the command line or the bridge: "
+              "this session's rows will be recorded with an empty participantid.")
 
     logger = Logger(raw_data_file="data/raw_data.jsonl", processed_data_file="data/decisions.csv")
     xlstm_log = args.log_path  # e.g. "state_data.log"; empty/unset = disabled
@@ -219,13 +932,31 @@ def main():
     fcd_engine = None
     state_engine = None
 
+    # ONE existence check, now that the explicit flag, the default AND the
+    # bridge have all had their say. Without it the strategy constructs with
+    # ok=False and every decision silently falls back -- which in a study block
+    # means five calls served by something that is not the condition's model,
+    # and in the data that is indistinguishable from the model performing badly.
+    if (state_model == "xlstm" and not args.data_collection
+            and modeltype in ("state", "combined")
+            and not os.path.exists(xlstm_model_path)):
+        print(f"[main] WARNING xLSTM checkpoint NOT FOUND: {xlstm_model_path} "
+              f"-- every decision will fall back.")
+
+    # --- Data collection: no inference, so no model is loaded at all ---
+    # DataCollector only starts its decision worker when it has an engine, so
+    # leaving `strategy` None is what actually disables inference; skipping the
+    # load also keeps the XGBoost/xLSTM weights and their threads out of a run
+    # that would never use them.
+    if args.data_collection:
+        print("[main] --data-collection: no decision engine, recording data only.")
+
     # --- FCD only ---
-    if modeltype == "fcd":
+    elif modeltype == "fcd":
         try:
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
                 default_function=functionname,
-                conservative=True,
             )
             strategy = fcd_engine
             print("[main] FCD model loaded successfully from trained_models/fcd_levels.pkl")
@@ -238,7 +969,6 @@ def main():
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
                 default_function=functionname,
-                conservative=True,
             )
             strategy = fcd_engine
             print("[main] FCD model loaded successfully for collection")
@@ -250,19 +980,19 @@ def main():
         try:
             if state_model == "xlstm":
                 state_engine = StateXLSTMLoAStrategy(
-                    model_path="trained_models/state_xlstm.pt",
+                    model_path=xlstm_model_path,
                     default_function=functionname,
                     window=window_sz,
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
                     window_seconds=window_seconds,
+                    participantid=participantid,
                 )
-                print(f"[main] xLSTM model loaded successfully from trained_models/state_xlstm.pt (window={state_engine.window_seconds}s)")
+                print(f"[main] xLSTM served from {xlstm_model_path} (window={state_engine.window_seconds}s)")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
                     default_function=functionname,
-                    conservative=True,
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
@@ -279,7 +1009,6 @@ def main():
             fcd_engine = XGBoostLoAStrategy(
                 model_path="trained_models/fcd_levels.pkl",
                 default_function=functionname,
-                conservative=True,
             )
             print("[main] Combined-FCD part loaded successfully.")
         except Exception as e:
@@ -289,19 +1018,19 @@ def main():
         try:
             if state_model == "xlstm":
                 state_engine = StateXLSTMLoAStrategy(
-                    model_path="trained_models/state_xlstm.pt",
+                    model_path=xlstm_model_path,
                     default_function=functionname,
                     window=window_sz,
                     fcd_fallback=None,
                     log_path=xlstm_log or None,
                     window_seconds=window_seconds,
+                    participantid=participantid,
                 )
                 print(f"[main] Combined-STATE (xLSTM) part loaded successfully (window={state_engine.window_seconds}s).")
             else:
                 state_engine = StateLevelsLoAStrategy(
                     model_path="trained_models/state_levels.pkl",
                     default_function=functionname,
-                    conservative=True,
                     prob_threshold=0.0,
                     fcd_fallback=None,
                 )
@@ -315,7 +1044,6 @@ def main():
                 fcd_strategy=fcd_engine,
                 state_strategy=state_engine,
                 w_fcd=w_fcd,
-                conservative=True,
             )
             print("[main] CombinedFusionStrategy initialized successfully.")
         except Exception as e:
@@ -342,7 +1070,19 @@ def main():
     # Add: Read vehicle_id and attempt to connect to CARLA to get the vehicle actor (optional)
     # ---------------------------------------------------------------------
     vehicle_actor = None
-    if vehicle_state_url:
+    # Held for the process lifetime, deliberately: these own the RPC connection
+    # the actor is read through, and letting them be collected would leave the
+    # actor pointing at a torn-down client. Not otherwise used, hence the names.
+    _carla_client = None
+    _carla_world = None
+    if vehicle_state_file:
+        # File bridge: a separate process owns the CARLA client and publishes
+        # state to a file. Skipping the connection here is the entire point —
+        # this process must never construct a carla.Client, because polling
+        # CARLA from inside ProVoice corrupts its heap.
+        print(f"[INFO] vehicle_state_file set ({vehicle_state_file}) — "
+              f"skipping direct CARLA connection.")
+    elif vehicle_state_url:
         # Bridge URL provided — no direct CARLA connection needed; the bridge
         # reads from CARLA locally on the remote and serves speed/location over HTTP.
         print(f"[INFO] vehicle_state_url set — skipping direct CARLA connection.")
@@ -358,7 +1098,8 @@ def main():
             vehicle_id = read_vehicle_id(wait_seconds=10.0)
 
         if vehicle_id is not None and HAS_CARLA:
-            vehicle_actor = get_carla_vehicle_by_id(vehicle_id, host=host, port=port, timeout=carla_timeout)
+            vehicle_actor, _carla_client, _carla_world = get_carla_vehicle_by_id(
+                vehicle_id, host=host, port=port, timeout=carla_timeout)
             if vehicle_actor is None:
                 print("[WARN] Could not obtain vehicle actor from CARLA. DataCollector will run without carla_vehicle.")
             else:
@@ -370,7 +1111,30 @@ def main():
                 print("[WARN] CARLA API not available in this process; DataCollector will run without carla_vehicle.")
 
     # Determine cam_index for DataCollector
-    if camera_source == "udp":
+    if webcam and camera_source != "front":
+        # Both given. Honour the explicit source -- it is the more specific
+        # instruction -- but say so out loud: silently ignoring a flag is how a
+        # session ends up recording the wrong camera without anyone noticing.
+        print(f"[camera] --webcam ignored: camera_source={camera_source} was given "
+              f"explicitly and takes precedence.")
+        webcam = False
+
+    if webcam:
+        cam_index = _WEBCAM_INDEX
+        # Refuse up front rather than discover it at the end. Every visual and
+        # physiological signal (EAR, MAR, gaze, emotion, HR, RR) comes off this
+        # camera, so a session that starts without it records nothing usable --
+        # and the failure is trivially fixable in the 30 s before driving.
+        why = _check_camera_index(cam_index)
+        if why:
+            raise SystemExit(
+                f"[FATAL] --webcam expects the external webcam at camera index "
+                f"{cam_index}, but {why}. Nothing visual or physiological would be "
+                f"recorded this session. Replug the webcam and retry, or pin the "
+                f"right device with camera_source=N (0 is normally the built-in "
+                f"camera). Drop --webcam to accept index 0 without this check.")
+        print(f"[camera] --webcam: using index {cam_index}")
+    elif camera_source == "udp":
         cam_index = camera_url
     elif camera_source.isdigit():
         cam_index = int(camera_source)
@@ -394,30 +1158,162 @@ def main():
         static_context=static_context,
         carla_vehicle=vehicle_actor,  # might be None
         vehicle_state_url=vehicle_state_url,
+        vehicle_state_path=vehicle_state_file,
+        state_poll_hz=args.state_poll_hz,
         window_size=window_sz,
+        decision_hz=args.decision_hz,
+        calibration_only=args.calibration_only,
+        data_collection=args.data_collection,
+        traffic_seed=traffic_seed,
     )
+
+    # Live-study LoA feed. Attached to the collector's decision hook rather than
+    # called from anywhere in main: the decision thread is the only place that
+    # knows both the served level and the FRAME timestamp it was computed from,
+    # and that pairing is the whole point of the feed.
+    decision_bridge = None
+    if getattr(args, "study_bridge", False):
+        if not status_url:
+            print("[study-bridge] --study-bridge given but no status URL is "
+                  "reachable; decisions will NOT be published. The drive side "
+                  "will log every call as skipped (no_status_file).")
+        else:
+            def _drive_ended():
+                # Same shutdown the --data-collection timeout performs. The
+                # study's block length is decided by DRIVE (it owns the call
+                # schedule and the 10 min clock), so this side must be told
+                # rather than run a timer of its own -- two independent timers
+                # would drift, and the one that fired first would truncate the
+                # other's data.
+                print("[main] Drive ended the block; stopping.")
+                data_collector.stop()
+                server.should_exit = True
+
+            decision_bridge = DecisionBridge(
+                status_url, session_id=session_id, participantid=participantid,
+                # NOT args.study_checkpoint_id directly -- see the resolution
+                # block above main() where this local is derived from
+                # xlstm_model_path when the flag was left unset, which is the
+                # normal case under --remote.
+                checkpoint_id=study_checkpoint_id, on_drive_ended=_drive_ended)
+            if decision_bridge.start():
+                data_collector.on_decision = decision_bridge.publish
+            else:
+                decision_bridge = None
 
     dashboard.data_collector = data_collector
     dashboard.actuator = actuator
 
-    data_collector.start()
-
     config = uvicorn.Config(dashboard.app, host="127.0.0.1", port=8001, reload=False)
     server = uvicorn.Server(config)
 
+    if args.calibration_only:
+        # The collector runs on its own thread and cannot stop the server; give
+        # it the hook. Installed BEFORE start() so a calibration that finishes
+        # unusually early (e.g. no camera → default baselines immediately) still
+        # finds the callback in place.
+        def _calibration_finished():
+            print("[main] calibration stored — exiting (--calibration-only).")
+            data_collector.stop()
+            server.should_exit = True
+        data_collector.on_calibration_complete = _calibration_finished
+
+    # Hard wall-clock cap on a --data-collection run (start_experiment.py's
+    # --experiment-data-collection-provoice-remote preset sets 900s = 15 min).
+    # Started once collection actually begins, right after data_collector.start()
+    # below, and stops this process THE SAME WAY --calibration-only stops itself
+    # above: data_collector.stop() + server.should_exit = True, which the
+    # shutdown `finally` turns into the identical 'provoice_ended' post — so a
+    # --remote Drive shows its end-of-session screen exactly as it does at the
+    # end of calibration, with no separate signal path to keep in sync.
+    data_collection_timer = None
+    if args.data_collection and args.data_collection_timeout:
+        def _data_collection_timeout():
+            print(f"[main] --data-collection-timeout "
+                  f"({args.data_collection_timeout:.0f}s) elapsed — stopping "
+                  f"(--data-collection).")
+            data_collector.stop()
+            server.should_exit = True
+        data_collection_timer = threading.Timer(args.data_collection_timeout,
+                                                _data_collection_timeout)
+        data_collection_timer.daemon = True
+        print(f"[main] --data-collection-timeout: this run stops itself "
+              f"{args.data_collection_timeout:.0f}s after collection starts.")
+
+    # --- Reverse channel to the CARLA machine --------------------------------
+    # Locally, Drive watches raw_data.jsonl for this session's first line and
+    # starts its LoA windows on it. Split across two machines that file is on
+    # THIS side, so the same fact has to be sent rather than observed.
+    if status_url:
+        print(f"[status] reverse bridge: {status_url} "
+              f"(collection_started at the first logged frame, provoice_ended "
+              f"on exit)")
+
+        def _first_frame():
+            # Off the collection loop: this posts over the network, and that
+            # loop is the one holding the perception cadence. A blocked tick
+            # here would show up as a gap in the very data being announced.
+            threading.Thread(
+                target=post_status_event,
+                args=(status_url, "collection_started", session_id, participantid),
+                name="status-started", daemon=True).start()
+        data_collector.on_first_frame_logged = _first_frame
+    elif vehicle_state_url:
+        # Either none was published, or the one published could not be reached
+        # (resolve_status_url has already said which, and how to fix it).
+        print("[status] running WITHOUT a reverse bridge: Drive on the other "
+              "machine will fall back to its popup-wait timeout for the start, "
+              "and will not be told when this run ends — stop the drive there "
+              "by hand.")
+
+    data_collector.start()
+    if data_collection_timer is not None:
+        data_collection_timer.start()
+
     def handle_exit(_, __):
-        print("KeyboardInterrupt received")
+        print("[main] shutdown signal received — stopping cleanly.")
         if data_collector:
             data_collector.stop()
         server.should_exit = True
 
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
+    # SIGBREAK is what Windows delivers for CTRL_BREAK_EVENT, and that is how
+    # start_experiment.py now asks this process to stop. Without this handler
+    # the default action terminates the process outright, which is exactly the
+    # abrupt death we are trying to avoid: it leaves the CARLA RPC connection
+    # severed rather than closed, and CARLA cannot then distinguish a normal
+    # end-of-run from a ProVoice crash.
+    #
+    # Registering it matters more than it looks. Until now the launcher stopped
+    # this process with TerminateProcess (Popen.terminate() is an alias for
+    # kill() on Windows), so NEITHER handler above had ever run in a real
+    # session -- every run ended abruptly, whether or not anything went wrong.
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, handle_exit)
 
     try:
         server.run()
     finally:
+        if data_collection_timer is not None:
+            # Idempotent whether the timer already fired (it is what got us
+            # here) or not (some other exit path won the race) — cancel() on an
+            # already-fired Timer is a harmless no-op.
+            data_collection_timer.cancel()
         data_collector.stop()
+        # Sent from the finally, so it covers EVERY way this process ends that
+        # leaves Python running: a clean exit, Ctrl-C, the launcher's
+        # CTRL_BREAK, an exception out of server.run(), and the calibration
+        # callback's own shutdown. It cannot cover a hard native fault
+        # (0xC0000005 and friends) -- nothing in this process can -- so the
+        # other machine also keeps its manual stop.
+        if status_url:
+            if decision_bridge is not None:
+                decision_bridge.stop()
+            post_status_event(
+                status_url, "provoice_ended", session_id, participantid,
+                reason=("calibration complete" if args.calibration_only
+                        else "data collection ended"))
         logger.close()
         for _s in (state_engine, fcd_engine, strategy):
             if hasattr(_s, "close"):

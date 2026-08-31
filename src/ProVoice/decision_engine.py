@@ -5,22 +5,37 @@ import math, os
 import numpy as np
 from ProVoice.fcd_config import FCD_NAMES, get_fcd_for_function, resolve_function_key, adjust_fcd_by_state
 from ProVoice.models.xlstm_model import (
-    encode_frame,
+    encode_and_resample,
     DEFAULT_CONTEXT_LENGTH,
     load_checkpoint,
     log_encoded_frames,
     logits_to_probs,
+    probs_to_label,
+    secs_of_day as _secs_of_day,
 )
 import torch
 
 
-def _policy_from_loa(loa: int, conservative: bool = True) -> Tuple[str, str]:
-    loa = max(0, min(int(loa), 4))
-    if conservative:
-        mapping = {0: ("none", "low"), 1: ("suggest", "low"), 2: ("ask_approval", "medium"), 3: ("auto_with_veto", "high"), 4: ("auto", "high")}
-    else:
-        mapping = {0: ("none", "low"), 1: ("suggest", "medium"), 2: ("auto_with_veto", "medium"), 3: ("auto", "high"), 4: ("auto", "high")}
-    return mapping[loa]
+# LoA -> (action, level). One fixed policy: at every level the system asks
+# before it acts, and only full autonomy at LoA 4.
+#
+# There used to be a second, more aggressive mapping selected by a
+# `conservative` parameter that every caller passed as True and no CLI flag
+# ever set — dead configuration that made the policy look variable when it was
+# not. Removed rather than wired up: a study comparing personalization arms
+# needs the LoA->action mapping held FIXED across participants and arms, so a
+# switch here would be a confound, not a feature.
+_LOA_POLICY: Dict[int, Tuple[str, str]] = {
+    0: ("none",           "low"),
+    1: ("suggest",        "low"),
+    2: ("ask_approval",   "medium"),
+    3: ("auto_with_veto", "high"),
+    4: ("auto",           "high"),
+}
+
+
+def _policy_from_loa(loa: int) -> Tuple[str, str]:
+    return _LOA_POLICY[max(0, min(int(loa), 4))]
 
 def _softmax(logits: List[float]) -> List[float]:
     m = max(logits); exps = [math.exp(x - m) for x in logits]; S = sum(exps); return [x / S for x in exps]
@@ -47,25 +62,9 @@ def _decide_from_probs(probs: List[float], method: str = "argmax", expected_shif
         return 4
     return int(max(range(len(probs)), key=lambda i: probs[i]))
 
-def _secs_of_day(ts: Any) -> Optional[float]:
-    """Parse a frame timestamp ('HH:MM:SS.fff' or full ISO) to seconds-of-day."""
-    if not ts:
-        return None
-    s = str(ts).strip()
-    from datetime import datetime
-    t = None
-    try:
-        t = datetime.fromisoformat(s).time()
-    except Exception:
-        for fmt in ("%H:%M:%S.%f", "%H:%M:%S"):
-            try:
-                t = datetime.strptime(s, fmt).time()
-                break
-            except Exception:
-                continue
-    if t is None:
-        return None
-    return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+# _secs_of_day now lives in xlstm_model (imported above as _secs_of_day): the
+# resampler needs the same parser, and xlstm_model is the lower module — this
+# one imports it, not the other way round.
 
 
 def truncate_frames_by_seconds(seq: List[Dict[str, Any]], window_seconds: float) -> List[Dict[str, Any]]:
@@ -108,7 +107,7 @@ def _loa0_result(reason: str, fn_key_or_name: str, fcd: Optional[Dict[str, int]]
 
     fn_key = resolve_function_key(fn_key_or_name)
     fcd = fcd or get_fcd_for_function(fn_key)
-    action, level = _policy_from_loa(0, conservative=True)
+    action, level = _policy_from_loa(0)
     return {
         "action": action, "level": level, "LoA": 0,
         "message": f"fallback LoA0: {reason}",
@@ -124,7 +123,7 @@ class BaseStrategy(ABC):
 
 
 class XGBoostLoAStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str], default_function: str, conservative: bool = True,
+    def __init__(self, model_path: Optional[str], default_function: str,
                  temperature: float = 1.0, class_bias: Optional[List[float]] = None,
                  decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
         self.model = None
@@ -136,7 +135,6 @@ class XGBoostLoAStrategy(BaseStrategy):
             print(f"Error loading FCD model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
-        self.conservative = conservative
         self.temperature = float(os.getenv("PV_TEMP", str(temperature)))
         self.class_bias = class_bias if class_bias is not None else [0.0]*5
         self.decision_method = (os.getenv("PV_DECISION_METHOD", decision_method)).lower()
@@ -158,7 +156,7 @@ class XGBoostLoAStrategy(BaseStrategy):
                 probs = [0.0]*5; probs[max(0, min(4, k))] = 1.0
             probs_pp = _apply_temp_bias_probs(probs, self.temperature, self.class_bias)
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
-            action, level = _policy_from_loa(loa, conservative=self.conservative)
+            action, level = _policy_from_loa(loa)
             return {"action": action, "level": level, "LoA": loa, "message": "FCD xgboost", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
         except Exception as e:
             fn = state.get("functionname") or self.default_key
@@ -168,7 +166,7 @@ _STATE_CAT = ['emotion','lab','environment','secondary_task']
 _STATE_NUM = ['drowsiness_alert','gaze_distracted','heart_rate']
 
 class StateLevelsLoAStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str], default_function: str, conservative: bool = True,
+    def __init__(self, model_path: Optional[str], default_function: str,
                  prob_threshold: Optional[float] = None, fcd_fallback: Optional[BaseStrategy] = None,
                  temperature: float = 1.0, class_bias: Optional[List[float]] = None,
                  decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
@@ -181,7 +179,6 @@ class StateLevelsLoAStrategy(BaseStrategy):
             print(f"Error loading state model: {e}")
             self.model = None
         self.default_key = resolve_function_key(default_function)
-        self.conservative = conservative
         self.prob_threshold = float(prob_threshold) if prob_threshold is not None else None
         self.fcd_fallback = fcd_fallback
         self.temperature = temperature
@@ -201,7 +198,11 @@ class StateLevelsLoAStrategy(BaseStrategy):
             return 0.0
 
     def _extract_features(self, state: Dict[str, Any]) -> Optional[np.ndarray]:
-        cats = [str(state.get(k, "")) for k in _STATE_CAT]
+        # `or ""` not `.get(k, "")`: emotion is now None when the classifier
+        # produced no reading, and str(None) would feed the literal "None" to
+        # the categorical encoder as though it were a class it had been
+        # trained on. Absent and empty must encode identically here.
+        cats = [str(state.get(k) or "") for k in _STATE_CAT]
         has_any = any(cats) or any(k in state for k in _STATE_NUM)
         if not has_any: return None
         fn = state.get("functionname") or self.default_key
@@ -236,7 +237,7 @@ class StateLevelsLoAStrategy(BaseStrategy):
                 return self._try_fcd_fallback(state, fn, fcd)
             probs_pp = _apply_temp_bias_probs(probs, self.temperature, self.class_bias)
             loa = _decide_from_probs(probs_pp, self.decision_method, self.expected_shift, self.quantile_tau)
-            action, level = _policy_from_loa(loa, conservative=self.conservative)
+            action, level = _policy_from_loa(loa)
             return {"action": action, "level": level, "LoA": loa, "message": "State model", "fcd": fcd, "probs": probs_pp, "profile": resolve_function_key(fn), "fallback": False}
         except Exception as e:
             print(f"Error in state model: {e}")
@@ -246,9 +247,18 @@ class StateLevelsLoAStrategy(BaseStrategy):
 
 
 class StateXLSTMLoAStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str], default_function: str, window: int = 256, conservative: bool = True,
+    def __init__(self, model_path: Optional[str], default_function: str, window: int = 256,
                  fcd_fallback: Optional[BaseStrategy] = None, log_path: Optional[str] = None,
-                 window_seconds: Optional[float] = None):
+                 window_seconds: Optional[float] = None,
+                 participantid: Optional[str] = None):
+        # FIRST statement: __del__ runs on any partially-constructed instance,
+        # and it reads this attribute. `load_checkpoint` below can raise (a
+        # corrupt or arch-incompatible .pt), and while that is caught here, an
+        # uncaught failure anywhere in __init__ would otherwise leave __del__
+        # raising AttributeError during garbage collection — where exceptions
+        # are printed and swallowed, masking the real error with a confusing
+        # second one.
+        self._log_fh = None
         self.model = None
         # `window` is only a fallback; the authoritative sequence length is
         # `context_length` taken from the loaded checkpoint's arch.
@@ -259,11 +269,45 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         try:
             if model_path and os.path.exists(model_path):
                 self.model, arch = load_checkpoint(model_path)
+                # Live-study checkpoints (minted by build_study_checkpoints.py)
+                # carry provenance in arch['study'], including which driver
+                # they were held out for. Serving one to the wrong driver is
+                # silent and unrecoverable once the session has run, so this
+                # must be a hard refusal, not a warning -- see CLAUDE.md
+                # "Checkpoint naming and provenance". Checkpoints with no
+                # 'study' key (population / plain LODO checkpoints) carry no
+                # such claim and are unaffected by this check.
+                study_meta = arch.get("study")
+                if study_meta:
+                    held_out = str(study_meta.get("held_out_pid"))
+                    pid_str = str(participantid) if participantid else ""
+                    if not pid_str or held_out != pid_str:
+                        raise RuntimeError(
+                            f"REFUSING to serve {model_path!r}: this checkpoint "
+                            f"was held out for participant {held_out!r}, but this "
+                            f"session's participantid is {pid_str!r}. Serving it "
+                            f"anyway would silently give this driver another "
+                            f"driver's personalized head."
+                        )
                 self.context_length = int(arch.get("context_length", self.context_length))
                 # 'corn' checkpoints emit K-1 conditional logits; logits_to_probs
                 # turns either head type into a 5-class PMF. Old checkpoints
                 # lack the key -> softmax.
                 self.head_type = str(arch.get("head_type", "softmax"))
+                # State what was actually loaded. The head's WIDTH is the only
+                # thing that distinguishes an FCD-augmented checkpoint from a
+                # plain one -- forward() switches on it, no flag is stored, and
+                # both load without complaint. So a narrow checkpoint served by
+                # mistake in place of an --embed-fcd one is silent: it runs, it
+                # predicts, and nothing says the task block is missing. One line
+                # at load time is what makes that visible in a session log.
+                width = self.model.head.in_features
+                print(f"[xlstm] loaded {os.path.basename(model_path)}: "
+                      f"head {width}-dim "
+                      f"({'z+FCD, AUGMENTED' if self.model.head_uses_fcd() else 'z only, plain'}), "
+                      f"embedding_dim={self.model.embedding_dim}, "
+                      f"head_type={self.head_type}, "
+                      f"context_length={self.context_length}")
                 self.ok = True
         except Exception as e:
             print(f"Error loading state model: {e}")
@@ -281,8 +325,14 @@ class StateXLSTMLoAStrategy(BaseStrategy):
         else:
             ws = 20.0
         self.window_seconds = float(ws) if ws and float(ws) > 0 else None
+        # Fixed-grid resampling rate. Taken ONLY from the checkpoint — unlike
+        # window_seconds there is no sane operator override, because serving on a
+        # different grid than the model was trained on is precisely the failure
+        # this is here to prevent. Legacy checkpoints lack the key -> None -> the
+        # raw frames are used, which is the behaviour they were trained with.
+        _rs = arch.get("resample_hz")
+        self.resample_hz = float(_rs) if _rs and float(_rs) > 0 else None
         self.default_key = resolve_function_key(default_function)
-        self.conservative = conservative
         self.fcd_fallback = fcd_fallback
         try:
             self._log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
@@ -291,15 +341,22 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             self._log_fh = None
 
     def close(self) -> None:
-        if self._log_fh is not None:
+        # getattr, not self._log_fh: belt-and-braces for the same reason the
+        # attribute is initialised first — close() must be safe to call on an
+        # instance whose __init__ did not finish.
+        fh = getattr(self, "_log_fh", None)
+        if fh is not None:
             try:
-                self._log_fh.close()
+                fh.close()
             except Exception:
                 pass
             self._log_fh = None
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass   # never raise from a finalizer
 
     def _try_fcd_fallback(self, state: Dict[str, Any], fn: str) -> Dict[str, Any]:
         fcd = get_fcd_for_function(fn)
@@ -317,27 +374,40 @@ class StateXLSTMLoAStrategy(BaseStrategy):
             if not seq:
                 return self._try_fcd_fallback(state, fn)
             # Truncate by TIME first (match the 20 s label-window semantics the
-            # model was trained on), then cap by frame count as a safety bound.
+            # model was trained on), then resample onto the checkpoint's fixed
+            # grid so the step count matches training regardless of the rate this
+            # session achieved, then cap by frame count as a safety bound.
             # No padding at inference: batch size is 1, the model is causal, and
-            # forward() without `lengths` reads the last timestep — which here is
-            # the most recent real frame. Short early-session windows are fine.
+            # forward() without `lengths` reads the last timestep — which the
+            # resampler anchors on the most recent real frame. Short
+            # early-session windows are fine, they just yield fewer steps.
             if self.window_seconds:
                 seq = truncate_frames_by_seconds(seq, self.window_seconds)
-            Xs = [encode_frame(fn, s) for s in seq[-self.context_length:]]
+            X = encode_and_resample(
+                seq,
+                resample_hz=self.resample_hz,
+                window_seconds=self.window_seconds,
+                functionname=fn,
+            )[-self.context_length:]
             if self._log_fh is not None:
                 # Log only the last frame (most recent driver state) to keep
                 # the file manageable at 20 Hz.
                 log_encoded_frames(
                     self._log_fh, "infer",
                     state.get("timestamp", ""),
-                    np.stack(Xs[-1:], axis=0),
+                    X[-1:],
                 )
             with torch.no_grad():
-                xb = torch.from_numpy(np.stack(Xs, 0))[None, ...]
+                xb = torch.from_numpy(X)[None, ...]
                 logits = self.model(xb)
-                probs = logits_to_probs(logits, self.head_type).cpu().numpy()[0].tolist()
-            loa = _decide_from_probs(probs, "argmax")
-            action, level = _policy_from_loa(loa, conservative=self.conservative)
+                pmf = logits_to_probs(logits, self.head_type)
+                # Decode with the head's canonical rule — for CORN that is Shi
+                # et al.'s rank rule sum_k 1[q_k > 0.5] (the PMF's median), not
+                # argmax (its mode). Same function the trainers and the sweep
+                # use, so the LoA served is the LoA those curves measured.
+                loa = int(probs_to_label(pmf, self.head_type)[0])
+                probs = pmf.cpu().numpy()[0].tolist()
+            action, level = _policy_from_loa(loa)
             fcd = get_fcd_for_function(fn)
             return {"action": action, "level": level, "LoA": loa, "message": "State XLSTM", "fcd": fcd, "probs": probs, "profile": resolve_function_key(fn), "fallback": False}
         except Exception as e:
@@ -348,14 +418,26 @@ class StateXLSTMLoAStrategy(BaseStrategy):
 
 class CombinedFusionStrategy(BaseStrategy):
     def __init__(self, fcd_strategy: BaseStrategy, state_strategy: BaseStrategy, w_fcd: float = 0.7,
-                 conservative: bool = True, decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
+                 decision_method: str = "argmax", expected_shift: float = 0.0, quantile_tau: float = 0.65):
         self.fcd_strategy = fcd_strategy
         self.state_strategy = state_strategy
         self.w_fcd = float(w_fcd); self.w_state = 1.0 - float(w_fcd)
-        self.conservative = conservative
         self.decision_method = decision_method
         self.expected_shift = expected_shift
         self.quantile_tau = quantile_tau
+
+    def _warn_degraded(self, reason):
+        """Say it ONCE per distinct reason, on the console, as it happens.
+
+        decisions.csv is read after the session; a block that ran without the
+        state model cannot be recovered by then. At 4 Hz an unthrottled warning
+        would also bury everything else in the log.
+        """
+        if reason in self._degraded_seen:
+            return
+        self._degraded_seen.add(reason)
+        print("[decision] DEGRADED: %s. Every decision from here is missing "
+              "half the model." % reason)
 
     def decide(self, state: Dict[str, Any]) -> Dict[str, Any]:
         fn = state.get("functionname", "")
@@ -363,6 +445,8 @@ class CombinedFusionStrategy(BaseStrategy):
             of = self.fcd_strategy.decide(state)
         except Exception as e:
             of = _loa0_result(f"Fusion FCD error: {e}", fn)
+        if not hasattr(self, "_degraded_seen"):
+            self._degraded_seen = set()
         try:
             os_ = self.state_strategy.decide(state)
         except Exception as e:
@@ -373,13 +457,40 @@ class CombinedFusionStrategy(BaseStrategy):
         # trained xLSTM checkpoint -> fall back to the FCD model alone.)
         if of_fb and os_fb:
             return _loa0_result("Fusion: both FCD and state unavailable", fn)
+        # A HALF-DEAD FUSION IS STILL A FALLBACK, and must say so in the
+        # top-level columns.
+        #
+        # These two branches used to spread `of` / `os_` unchanged, and those
+        # carry "fallback": False -- so a run in which the state model fell back
+        # on EVERY tick wrote fallback=False, fallback_reason="" to all of
+        # decisions.csv, with the truth buried in the nested `sub` JSON. That is
+        # how a session that served zero model predictions looked clean: seen
+        # 2026-08-21, where a missing state_xlstm.pt left the FCD XGBoost
+        # deciding alone on a static per-function vector, and the served LoA was
+        # therefore constant for the whole run.
+        #
+        # `fallback` here means "this decision is not what the configuration
+        # asked for", not "LoA 0" -- the LoA is still the surviving model's, and
+        # `sub` still holds both halves.
         if os_fb:
-            return {**of, "message": (str(of.get("message", "")) + " (state unavailable; FCD-only)").strip(), "sub": {"fcd": of, "state": os_}}
+            reason = ("state unavailable (%s); FCD-only"
+                      % (os_.get("fallback_reason") or "no reason given"))
+            self._warn_degraded(reason)
+            return {**of,
+                    "message": (str(of.get("message", "")) + " (state unavailable; FCD-only)").strip(),
+                    "fallback": True, "fallback_reason": reason,
+                    "sub": {"fcd": of, "state": os_}}
         if of_fb:
-            return {**os_, "message": (str(os_.get("message", "")) + " (FCD unavailable; state-only)").strip(), "sub": {"fcd": of, "state": os_}}
+            reason = ("FCD unavailable (%s); state-only"
+                      % (of.get("fallback_reason") or "no reason given"))
+            self._warn_degraded(reason)
+            return {**os_,
+                    "message": (str(os_.get("message", "")) + " (FCD unavailable; state-only)").strip(),
+                    "fallback": True, "fallback_reason": reason,
+                    "sub": {"fcd": of, "state": os_}}
         pf = of.get("probs", [0.2]*5); ps = os_.get("probs", [0.2]*5)
         probs = [self.w_fcd*pf[i] + self.w_state*ps[i] for i in range(5)]
         S = sum(probs); probs = [p / S if S>0 else 0.2 for p in probs]
         loa = _decide_from_probs(probs, self.decision_method, self.expected_shift, self.quantile_tau)
-        action, level = _policy_from_loa(loa, conservative=self.conservative)
+        action, level = _policy_from_loa(loa)
         return {"action": action, "level": level, "LoA": loa, "message": f"fusion w_fcd={self.w_fcd:.2f}", "fcd": of.get("fcd"), "probs": probs, "sub": {"fcd": of, "state": os_}, "fallback": False}

@@ -31,6 +31,9 @@ dependencies = [
     "pygame>=2.6.1",
     "ultralytics>=8.4.57",
     "keras>=3.12.0",
+    # Emotion recognition (maintained successor to HSEmotion): EfficientNet/
+    # MobileViT ONNX models on AffectNet. Replaces the FER2013 mini-Xception.
+    "emotiefflib>=1.1.1",
     "pandas-stubs>=2.3.3",
     "joblib>=1.5.2",
     # Deliberately pinned: the committed trained_models/*.pkl are sklearn
@@ -53,11 +56,29 @@ dependencies = [
     "einops",
     "dacite",
     "omegaconf",
-    "coral-pytorch>=1.4.0",
+    "autogluon>=1.6.1",
 ]
 
 [tool.uv]
 package = true
+# Exactly ONE OpenCV distribution may be installed. `opencv-python` and
+# `opencv-contrib-python` both ship the same top-level `cv2` package (same
+# module, same DLLs, contrib merely adds the extra modules), so installing both
+# means one wheel silently overwrites the other's files and the RECORDs
+# disagree about who owns them — upstream's own README says never to do this.
+#
+# We ended up with both transitively:
+#     emotiefflib, ultralytics -> opencv-python
+#     mediapipe                -> opencv-contrib-python
+# and all three are required, so neither parent can simply be dropped.
+#
+# `opencv-contrib-python` is a strict superset, so the resolution is to make
+# every request for the plain build inapplicable via a marker that can never be
+# true, leaving contrib to provide `cv2` for everyone. Verified afterwards with
+# `import cv2` + a contrib-only symbol (cv2.aruco).
+override-dependencies = [
+    "opencv-python ; sys_platform == 'no-such-platform'",
+]
 environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
